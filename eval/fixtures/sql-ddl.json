@@ -1,0 +1,7 @@
+{
+  "name": "SQL 索引失效 + DDL 顺序（数据一致性）",
+  "diff": "diff --git a/db/migration/V12__add_order_idx.sql b/db/migration/V12__add_order_idx.sql\n--- a/db/migration/V12__add_order_idx.sql\n+++ b/db/migration/V12__add_order_idx.sql\n@@ -1,3 +1,8 @@\n -- 订单表新索引\n+ALTER TABLE t_order ADD INDEX idx_user_created (user_id, created_at);\n+ALTER TABLE t_order MODIFY COLUMN status VARCHAR(64) NOT NULL DEFAULT 'INIT';\n+UPDATE t_order SET status = 'INIT' WHERE status IS NULL;\n+\n+-- 回滚：DROP INDEX idx_user_created ON t_order;\n",
+  "golden": [
+    { "file": "db/migration/V12__add_order_idx.sql", "line": 4, "category": "db-perf", "producer": "human" }
+  ]
+}
