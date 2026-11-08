@@ -16,6 +16,7 @@
  *     evidence_level 精确匹配（["test-confirmed"] 等，用于测试确认/证伪/未验证门）
  *     evidence_min   证据下限（rank：test-confirmed 4 > code-confirmed 3 > unverified 2 > test-falsified 1）
  *     contract       true（要求契约破坏）| false（要求非契约）
+ *     category_in    finding.category 落在给定一级/历史别名集合内（用于 P3 交付轴封顶等）
  *
  * 配置加载：workflow 每轮审查读 data/severity-rules.json——存在则校验后替换默认表，
  * 校验失败/文件损坏自动回退默认表并在报告 degraded_steps 留痕（不静默）。
@@ -47,12 +48,22 @@ export const DEFAULT_SEVERITY_RULES = [
   // P1：测试确认（有失败测试/复现步骤）且影响半径非 none
   { id: "P1-C3", severity: "P1", when: { evidence_level: ["test-confirmed"], impact_radius: ["all-traffic", "batch", "single"] } },
 
+  // P3 交付轴卫生门（须早于 P2 地板规则）：delivery/历史卫生 category + 单点/无影响 → 封顶 P3
+  // 避免「缺单测」被 P2-C4 抬成阻塞；全流量/整批仍可走上方 P0/P1
+  { id: "P3-C3-delivery-cap", severity: "P3",
+    when: { category_in: ["delivery", "maintainability", "test", "dependency", "architecture", "config"], impact_radius: ["single", "none"] } },
+
   // P2：数据依赖触发且影响半径非 none（CVSS「假设合理配置存在」→ 附升级条件）
   { id: "P2-C1", severity: "P2",
     escalation_clause: "若测试/线上观测证实该数据形态为常态且波及整批，应按 P1-C1 升级",
     when: { trigger: ["data-dependent"], impact_radius: ["all-traffic", "batch", "single"] } },
   // P2：证据门——unverified 封顶 P2（物理上到不了 P0/P1，消除「运气型升级」）
   { id: "P2-C2-unverified-cap", severity: "P2", when: { evidence_level: ["unverified"] } },
+  // P2：本次引入 + 单请求级 + 必然/有条件触发 + 证据≥源码确认
+  // （补门：此前会掉进 P3 兜底，低估「确定会坏但只伤单请求」的缺陷）
+  { id: "P2-C4-single-confirmed", severity: "P2",
+    escalation_clause: "若影响扩大到整批/全流量，应按 P1-C1 升级",
+    when: { introduced_by: ["this-pr"], impact_radius: ["single"], trigger: ["certain", "conditional"], evidence_min: "code-confirmed" } },
 
   // P3：无行为影响（风格/卫生/文档）
   { id: "P3-C1", severity: "P3", when: { impact_radius: ["none"] } },
@@ -90,7 +101,11 @@ export function validateSeverityRules(rules) {
       throw new Error(`规则 ${r.id}.when.evidence_min 必须是 ${EVIDENCE_LEVELS.join("|")}`);
     if (w.contract !== undefined && typeof w.contract !== "boolean")
       throw new Error(`规则 ${r.id}.when.contract 必须是布尔值`);
-    const unknown = Object.keys(w).filter((k) => !["introduced_by", "impact_radius", "impact_radius_not", "trigger", "trigger_not", "evidence_level", "evidence_min", "contract"].includes(k));
+    if (w.category_in !== undefined) {
+      if (!Array.isArray(w.category_in) || w.category_in.length === 0 || !w.category_in.every((v) => typeof v === "string" && v))
+        throw new Error(`规则 ${r.id}.when.category_in 必须是非空字符串数组`);
+    }
+    const unknown = Object.keys(w).filter((k) => !["introduced_by", "impact_radius", "impact_radius_not", "trigger", "trigger_not", "evidence_level", "evidence_min", "contract", "category_in"].includes(k));
     if (unknown.length) throw new Error(`规则 ${r.id}.when 含未知条件字段: ${unknown.join(",")}`);
     if (r.escalation_clause !== undefined && typeof r.escalation_clause !== "string")
       throw new Error(`规则 ${r.id}.escalation_clause 必须是字符串`);

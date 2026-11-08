@@ -34,8 +34,8 @@ const REPORT_JSON_INSTRUCTION = `
       "severity": "P0|P1|P2|P3（你的初步判断，系统会按锚点规则重算）",
       "impact_radius": "影响半径：all-traffic（全部流量/服务不可用）|batch（整批数据/整页）|single（单请求/单条数据）|none（无行为影响，风格/文档）",
       "trigger": "触发确定性：certain（必然触发）|conditional（代码内分支条件）|data-dependent（依赖线上数据形态，如缺配置占比）",
-      "category": "视角 id（见视角清单）",
-      "dimension": "internal|upstream_api|upstream_data|downstream_api|downstream_data",
+      "category": "一级视角轴 id：correctness|contract|data|security_fund|runtime|delivery（见视角清单；二级 checklist id 勿写入此字段）",
+      "dimension": "与 category 同值的一级轴 id（correctness|contract|data|security_fund|runtime|delivery）",
       "file": "文件路径（相对仓库根）",
       "line": 行号或null,
       "code_snippet": "相关代码片段（不超过10行）",
@@ -86,7 +86,7 @@ const DISCIPLINE = `
 1. 证据驱动：每个 finding 必须给出 file:line 与代码片段；调用 grep/find 工具核实，不要凭空推断。
 2. 不编造：无法核实的跨仓/运行时行为，在 decision_changes 中标 unverified 或 needs_human，严禁假装确定。
 3. 修复建议 100% 必填且可执行；能给出具体代码改法的给出改法。
-4. 定级锚点（需逐项勾选，系统按规则重算 severity）：P0=本次引入∧全部流量∧必然触发∧证据≥code-confirmed；P1=触发确定∧影响整批及以上∧证据≥code-confirmed，或契约破坏；P2=依赖线上数据形态触发（fail-fast 把正常空返回当异常这类）、unverified 证据（封顶）、存量问题（封顶）；P3=无行为影响（风格/卫生）。锚点字段（impact_radius/trigger）必须如实枚举，不要为了拔高/压低定级而虚构半径或触发确定性。
+4. 定级锚点（需逐项勾选，系统按规则重算 severity）：P0=本次引入∧全部流量∧必然触发∧证据≥code-confirmed；P1=触发确定∧影响整批及以上∧证据≥code-confirmed，或契约破坏；P2=单请求级已确认缺陷、数据依赖触发、unverified 封顶、存量非契约封顶；P3=无行为影响（风格/卫生）或 delivery 轴卫生项。锚点字段（impact_radius/trigger）必须如实枚举，不要为了拔高/压低定级而虚构半径或触发确定性。
 5. introduced_by 要区分本次引入 vs 存量问题（存量 P3 不报，存量 P1/P2 报但标注）。
 6. 不重复报已豁免的问题（豁免清单在上下文中给出时）。
 7. 大 PR 至少给出 1 条 tests 建议（针对最关键路径）；小 PR 可省略。
@@ -108,8 +108,10 @@ export function buildSystemPrompt() {
 你拥有 read/grep/find 等只读工具：必须用它们阅读 diff 涉及的完整文件上下文（工作区有 PR.diff）、检索调用方、核实依赖，而不是只看 diff 片段。
 工作区 repo/ 目录是 PR head 的完整源码树（git checkout）：diff 未涉及的同文件未改动行、下游消费方都可直接 read/grep 查证——发现引用了未在 diff 中出现的代码时，必须先读源码树确认其实际行为，禁止仅凭 diff 推测记为「证据缺口」。仅当 repo/ 目录不存在或目标文件确实缺失时才可声明证据缺口，并注明「无源码树」。
 
-== 审查视角清单（21 个，逐个过一遍，适用的深入审、不适用的写入 perspectives_skipped 字符串数组，如 "frontend: 无前端变更"） ==
+== 审查视角（MECE 一级 6 轴；逐轴覆盖，轴下二级 checklist 按需展开；不适用的一级轴写入 perspectives_skipped，如 "delivery: 无测试/配置/依赖变更"） ==
 ${renderPerspectivesForPrompt()}
+说明：findings.category / perspectives_covered 只填一级轴 id；二级 id（如 logic、mq）仅作审查要点，不要当作 category。
+
 
 ${DISCIPLINE}
 
@@ -121,8 +123,8 @@ export function buildFastSystemPrompt() {
   return `你是 CR-Agent，一名专家级代码审查工程师，运行在 pi coding agent harness 中。
 本次是小改动 PR，走快速审查通道：只聚焦高风险视角，快速产出结论。
 
-聚焦视角（其余视角标记 skipped，理由 "fast-path"）：
-- logic（逻辑/边界）、build（编译正确性）、contract（契约破坏）、fund-safety（资损）、security-generic（注入/敏感信息）、config（开关默认值）
+聚焦一级轴（其余轴标记 skipped，理由 "fast-path"）：
+- correctness（逻辑/边界/构建）、contract（契约破坏）、security_fund（资损/注入/鉴权）、data（若涉及 SQL/MQ/DDL）
 
 工具使用从简：仅在需要确认调用方或上下文时使用 grep/read。
 

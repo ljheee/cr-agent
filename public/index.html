@@ -51,7 +51,7 @@ details.raw pre{white-space:pre-wrap;word-break:break-all;font-size:11px;max-hei
 <body>
 <header>
   <h1>⚡ CR-Agent</h1>
-  <span class="mut small">pi-coding-agent · 21 审查视角 · 7 步流程</span>
+  <span class="mut small">pi-coding-agent · MECE 6 轴视角 · 7 步流程</span>
   <nav>
     <button data-view="submit" class="active">提交 CR</button>
     <button data-view="tasks">任务列表</button>
@@ -220,7 +220,7 @@ function renderReport(r){
       <div class="pill"><b>${(r.findings||[]).filter(f=>f.severity==='P0'||f.severity==='P1').length}</b>P0/P1</div>
       <div class="pill"><b>${r.review?.previous_findings?.length||0}</b>历史复核</div>
       <div class="pill"><b>${(r.decision_changes||[]).length}</b>跨仓查证</div>
-      <div class="pill"><b>${r.metrics?.perspectives_covered?.length||0}/${esc(r.review?.fast_path?'6':'21')}</b>视角覆盖</div>
+      <div class="pill"><b>${r.metrics?.perspectives_covered?.length||0}/6</b>一级视角覆盖</div>
       ${r._toolCalls?`<div class="pill"><b>${r._toolCalls}</b>工具调用</div>`:''}
       ${r.ledger_stats?.adoption_rate!=null?`<div class="pill"><b>采纳率 ${(r.ledger_stats.adoption_rate*100)|0}%</b></div>`:''}
       ${r.review?.review_bundles?.length||r.review_bundles?.length?`<div class="pill"><b>${(r.review_bundles||r.review.review_bundles).length}</b>分桶</div>`:''}
@@ -372,7 +372,6 @@ async function renderSettings(){
   app.innerHTML='<div class="card"><b>设置</b><p class="mut small">端点（OpenAI 兼容）与模型管理。凭证仅存本地 data/settings.json。</p><div id="sbody"><p class="mut">加载中…</p></div></div>';
   let s;
   try{ s=await api('/api/settings'); }catch(e){ return $('#sbody').innerHTML=`<p class="error">${esc(e.message)}</p>`; }
-  const pers=await api('/api/perspectives').catch(()=>[]);
   let modelSeq=0;
   const modelRowHtml=m=>{const i=modelSeq++;
     return `<div class="row" style="align-items:center;margin:4px 0">
@@ -426,11 +425,7 @@ async function renderSettings(){
     </div>
     <label>模型列表（${(s.models||[]).length} 个）</label>
     <div id="modelList">${(s.models||[]).map(modelRowHtml).join('')||'<p class="mut small">暂无模型</p>'}</div>
-    <div style="margin-top:18px">
-      <b class="small">审查视角（${pers.length} 个，其中新增 ${pers.filter(p=>p.isNew).length} 个）</b>
-      <div class="grid" style="margin-top:8px">${pers.map(p=>`<div class="pill">${esc(p.name)} ${p.isNew?'<span class="tag new">新增</span>':''}<span class="mut small">· ${p.dimension} · 权重${p.weight}</span></div>`).join('')}</div>
-    </div>
-    <p class="mut small" style="margin-top:18px">环境变量：CR_AGENT_DATA（数据目录）· PORT（服务端口）。密钥保存于 data/pi-home/auth.json（自动生成）。</p>`;
+    <p class="mut small" style="margin-top:18px">审查视角为 MECE 一级 6 轴（见 docs/mece-perspectives.md），不再在设置页枚举。环境变量：CR_AGENT_DATA · PORT。密钥保存于 data/pi-home/auth.json。</p>`;
 
   const collectModels=()=>{
     const ids=$$('#modelList input[data-mf="id"]');

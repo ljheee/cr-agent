@@ -37,11 +37,11 @@ export function normalizeAnchors(f) {
 }
 
 /** 契约破坏判定：仅 category 显式契约维度才认。
- * 教训（#247 实测）：impact 文本含「契约关键面」措辞的单测建议（category=test）
+ * 教训（#247 实测）：impact 文本含「契约关注面」措辞的单测建议（category=test）
  * 被关键词误伤判契约拔高定级——文本关键词不再单独触发。 */
 function isContractBreak(f, report) {
-  // 精确匹配 contract/契约：non-contract / contract-test 等含词值不误判为契约
-  if (/^(contract|契约)$/.test(String(f.category || "").trim())) return true;
+  // 精确匹配一级轴 contract / 旧别名 api-contract / 中文「契约」
+  if (/^(contract|api-contract|契约)$/.test(String(f.category || "").trim())) return true;
   const breaking = report?.impact?.breaking_changes;
   return Array.isArray(breaking) && breaking.some((b) => {
     const n = typeof b === "object" ? String(b.name || "") : String(b);
@@ -62,6 +62,10 @@ function ruleMatches(rule, f, a, isThisPr, contract) {
   if (w.evidence_level !== undefined && !w.evidence_level.includes(f.evidence_level)) return false;
   if (w.evidence_min !== undefined && !hasEvidence(f, w.evidence_min)) return false;
   if (w.contract !== undefined && contract !== w.contract) return false;
+  if (w.category_in !== undefined) {
+    const cat = String(f.category || "").trim();
+    if (!w.category_in.includes(cat)) return false;
+  }
   return true;
 }
 

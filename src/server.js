@@ -9,7 +9,7 @@
  *  - GET  /api/reports/:id   报告详情
  *  - GET  /api/ledger        PR 账本（问题闭环/豁免）
  *  - POST /api/ledger/exempt 豁免问题
- *  - GET  /api/perspectives  视角清单（设置页展示）
+ *  - GET  /api/perspectives  一级 MECE 视角清单（含二级 checklist 摘要）
  */
 import express from "express";
 import path from "node:path";
@@ -270,7 +270,12 @@ app.delete("/api/ledger/exempt", async (req, res) => {
 // ── 视角清单 ──
 app.get("/api/perspectives", (req, res) => {
   res.json(PERSPECTIVES.map((p) => ({
-    id: p.id, name: p.name, dimension: p.dimension, weight: p.weight, isNew: !!p.isNew,
+    id: p.id,
+    name: p.name,
+    dimension: p.dimension,
+    weight: p.weight,
+    checklist: p.checklist,
+    secondary: (p.secondary || []).map((s) => ({ id: s.id, name: s.name })),
   })));
 });
 

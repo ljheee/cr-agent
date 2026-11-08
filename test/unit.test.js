@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parsePrUrl, githubApiBase, sshHostFor, gitUrlFor } from "../src/pr-resolver.js";
 import { normalizeReport, buildAuthorSummary } from "../src/engine/report-schema.js";
-import { PERSPECTIVES, renderPerspectivesForPrompt } from "../src/engine/perspectives.js";
+import { PERSPECTIVES, DIMENSIONS, renderPerspectivesForPrompt, primaryPerspectiveId, listSecondaryPerspectives } from "../src/engine/perspectives.js";
 import { Ledger } from "../src/engine/ledger.js";
 import { buildModelsJson } from "../src/engine/pi-models.js"; // 纯函数模块：测试离线可跑，不拉 pi SDK 树
 import { mkdtemp, rm } from "node:fs/promises";
@@ -169,16 +169,22 @@ test("normalizeReport: blockers 兜底 = P0/P1", () => {
   assert.equal(r.author_summary.nice_to_have.length, 1);
 });
 
-test("PERSPECTIVES: 21 个视角，无 isNew 标记，维度合法", () => {
-  assert.equal(PERSPECTIVES.length, 21);
-  assert.equal(PERSPECTIVES.filter((p) => p.isNew).length, 0);
+test("PERSPECTIVES: MECE 一级 6 轴 + 二级 checklist", () => {
+  assert.deepEqual(DIMENSIONS, PERSPECTIVES.map((p) => p.id));
+  assert.equal(PERSPECTIVES.length, 6);
   for (const p of PERSPECTIVES) {
-    assert.ok(["internal", "upstream_api", "upstream_data", "downstream_api", "downstream_data"].includes(p.dimension), p.id);
-    assert.ok(p.checklist.length > 20, p.id);
+    assert.equal(p.dimension, p.id, p.id);
+    assert.ok(p.checklist.length > 10, p.id);
+    assert.ok(Array.isArray(p.secondary) && p.secondary.length >= 2, p.id);
   }
+  assert.equal(listSecondaryPerspectives().length, 21);
+  assert.equal(primaryPerspectiveId("logic"), "correctness");
+  assert.equal(primaryPerspectiveId("mq"), "data");
+  assert.equal(primaryPerspectiveId("contract"), "contract");
   const txt = renderPerspectivesForPrompt();
+  assert.ok(txt.includes("[correctness]"));
   assert.ok(txt.includes("[fund-safety]"));
-  assert.ok(txt.split("\n").length >= 21);
+  assert.ok(txt.includes("一级轴"));
 });
 
 test("buildModelsJson: custom provider 生成", () => {
@@ -312,7 +318,7 @@ test("normalizeReport 回归: metrics 垃圾值不覆盖 + 空串 conclusion 按
   }));
   assert.equal(r.conclusion, "不通过");           // 空 conclusion + P0 → 宁严勿松
   assert.ok(Array.isArray(r.metrics.perspectives_covered));  // 未被垃圾值覆盖
-  assert.equal(r.metrics.perspectives_covered[0], "logic");  // 采信模型顶层声明
+  assert.equal(r.metrics.perspectives_covered[0], "correctness");  // 顶层声明归一到一级轴
   assert.equal(r.metrics.new_findings, 1);         // 计算值生效
 });
 
@@ -696,12 +702,12 @@ test("isChangedLine: 新增行判定（pre-existing 程序化判定基础）", a
   assert.equal(isChangedLine(files, "nope.js", 5), null); // 文件不在 diff
 });
 
-test("routeByFileTypes: 文件类型→重点视角路由", async () => {
+test("routeByFileTypes: 文件类型→一级轴路由", async () => {
   const { routeByFileTypes } = await import("../src/engine/routing.js");
   const r = routeByFileTypes(["db/V12.sql", "a.proto", "src/App.vue"]);
-  assert.ok(r.focusPerspectives.includes("db-perf"));
+  assert.ok(r.focusPerspectives.includes("data"));
   assert.ok(r.focusPerspectives.includes("contract"));
-  assert.ok(r.focusPerspectives.includes("frontend"));
+  assert.ok(r.focusPerspectives.includes("correctness"));
   assert.equal(r.notes.length, 3);
   assert.equal(routeByFileTypes(["README.md"]).routedFiles, 0);
   assert.deepEqual(routeByFileTypes([]).focusPerspectives, []);
@@ -816,11 +822,12 @@ test("adoption_rate: trace 条目与 needs_human 不计入", async () => {
 
 test("routeByFileTypes: 专项规则先于通用扩展名 + 边界不误命中", async () => {
   const { routeByFileTypes } = await import("../src/engine/routing.js");
-  assert.ok(routeByFileTypes(["src/foo.test.ts"]).focusPerspectives.includes("test"));
-  assert.ok(routeByFileTypes(["test/bar_test.py"]).focusPerspectives.includes("test"));
-  assert.ok(routeByFileTypes(["src/FooTest.java"]).focusPerspectives.includes("test"));
+  assert.ok(routeByFileTypes(["src/foo.test.ts"]).focusPerspectives.includes("delivery"));
+  assert.ok(routeByFileTypes(["test/bar_test.py"]).focusPerspectives.includes("delivery"));
+  assert.ok(routeByFileTypes(["src/FooTest.java"]).focusPerspectives.includes("delivery"));
   assert.equal(routeByFileTypes(["src/contest/main.c"]).routedFiles, 0); // 无 test/ 边界不命中
-  assert.ok(routeByFileTypes(["docker-compose.yml"]).focusPerspectives.includes("build")); // 容器先于 YAML
+  assert.ok(routeByFileTypes(["docker-compose.yml"]).focusPerspectives.includes("delivery")); // 容器先于 YAML
+  assert.ok(routeByFileTypes(["docker-compose.yml"]).focusPerspectives.includes("security_fund"));
 });
 
 /* ───────── 第五轮 CR 修复回归 ───────── */
@@ -1124,6 +1131,20 @@ test("severity-anchors: 模糊带案例（fail-fast 依赖线上缺配置数据�
   assert.deepEqual(rep.blockers, []);                        // blockers 重算（降级后无高等级）
 });
 
+test("severity-anchors: P2-C4 单请求已确认地板 + P3-C3 delivery 封顶", async () => {
+  const { deriveSeverity } = await import("../src/engine/severity-anchors.js");
+  const single = {
+    introduced_by: "this-pr", impact_radius: "single", trigger: "certain",
+    evidence_level: "code-confirmed", category: "correctness",
+  };
+  assert.deepEqual(deriveSeverity(single, {}), { severity: "P2", rule: "P2-C4-single-confirmed" });
+  const hygiene = {
+    introduced_by: "this-pr", impact_radius: "single", trigger: "certain",
+    evidence_level: "code-confirmed", category: "delivery",
+  };
+  assert.deepEqual(deriveSeverity(hygiene, {}), { severity: "P3", rule: "P3-C3-delivery-cap" });
+});
+
 test("severity-anchors: unverified 物理封顶 P2（P0/P1 证据门）", async () => {
   const { deriveSeverity } = await import("../src/engine/severity-anchors.js");
   // 模型自报 P0 + 全量流量 + 必然触发，但 evidence=unverified → 封顶 P2
@@ -1180,7 +1201,8 @@ assert.equal(deriveSeverity(f1b, {}).rule, "P1-C2");
   assert.equal(deriveSeverity({ ...f4, category: "non-contract" }, {}).rule, "P0-C1", "non-contract 非契约");
   const f5 = { severity: "P3", evidence_level: "code-confirmed", introduced_by: "this-pr",
     impact_radius: "single", trigger: "conditional", category: "contract-test" };
-  assert.equal(deriveSeverity(f5, {}).severity, "P3", "contract-test 不走契约通道（P3-C2 兜底）");
+  // 含词非契约：不走 P1-C2；单请求已确认走 P2-C4 地板（不再静默掉进 P3）
+  assert.equal(deriveSeverity(f5, {}).rule, "P2-C4-single-confirmed", "contract-test 不走契约通道");
   assert.equal(deriveSeverity({ ...f5, category: "契约" }, {}).severity, "P1", "中文契约仍命中");
 });
 

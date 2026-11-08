@@ -17,11 +17,11 @@
 | 6 结论交付 | 报告页分层渲染（作者摘要→明细→原始 JSON） |
 | 7 迭代闭环 | previous_findings 复核 + **豁免清单** + unverified 2 轮升级 needs_human |
 
-### 21 个审查视角
+### MECE 审查视角（一级 6 轴 + 二级 checklist）
 
-逻辑/边界、上下游契约、灰度配置、测试覆盖、可观测性、代码卫生、性能资源、依赖治理、业务权限、构建正确性、数据口径、消息可靠性、上线顺序/DDL。
+一级轴（写入 `finding.category`）：**correctness** / **contract** / **data** / **security_fund** / **runtime** / **delivery**。
 
-通用安全（注入/敏感信息/凭证）、DB/SQL 性能、并发线程安全、资损资金安全、容量压测、事务多写一致性、前端兼容、架构模块边界。
+原 21 项经验下沉为各轴下的二级 checklist，只进 prompt 展开，不再平铺一级。设计说明见 [docs/mece-perspectives.md](docs/mece-perspectives.md)。
 
 ### 好的实践
 
@@ -95,8 +95,10 @@ src/
   pr-resolver.js          # PR 链接解析 + diff 获取（API/git 双通道）
   engine/
     workflow.js           # 7 步流程编排（模式选择/风险自适应/分桶/降级声明/凭证脱敏）
-    perspectives.js       # 21 审查视角定义
-    routing.js            # 文件类型→重点视角路由
+    perspectives.js       # MECE 一级 6 轴 + 二级 checklist
+    routing.js            # 文件类型→一级轴路由
+    severity-anchors.js   # 锚点定级（P0–P3 门禁规则求值）
+    severity-rules-default.js  # 默认定级规则表（可被 data/severity-rules.json 覆盖）
     bundler.js            # diff 解析/文件分桶/行号校验/Jaccard 去重
     prompts.js            # 系统/用户提示词（纪律条款 + schema 指令 + fast-path）
     report-schema.js      # 结构化报告 schema + 容错规范化

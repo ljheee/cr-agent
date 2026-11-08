@@ -8,6 +8,8 @@
  *  - 新增 verification（查证明细与失败升级建议：查不到就标 needs_human 而非每轮重试）
  *  - 新增 exempt（豁免清单：已接受风险的问题不再重复报）
  */
+import { primaryPerspectiveId, DIMENSIONS } from "./perspectives.js";
+
 export const REPORT_SCHEMA_VERSION = "cr-agent/1.0";
 
 export const FINDING_SEVERITIES = ["P0", "P1", "P2", "P3"];
@@ -30,8 +32,8 @@ export function findingTemplate() {
     severity: "P2",          // P0-P3（模型初判；最终由 severity-anchors 按锚点重算）
     impact_radius: "single", // 锚点：all-traffic | batch | single | none
     trigger: "data-dependent", // 锚点：certain | conditional | data-dependent
-    category: "",            // perspective id（如 logic / contract / fund-safety）
-    dimension: "internal",   // internal | upstream_api | upstream_data | downstream_api | downstream_data
+    category: "",            // 一级视角轴 id（correctness|contract|data|security_fund|runtime|delivery）
+    dimension: "correctness", // 与 category 对齐的一级轴（历史五维标签会在 normalize 时映射）
     file: "",
     line: null,
     code_snippet: "",
@@ -348,15 +350,20 @@ export function normalizeReport(raw) {
     const passish = /^(?:通过|pass|approve|approved|ok|lgtm|✅)$/i.test(String(report.conclusion || "").trim());
     report.conclusion = (hasBlocker || !passish) ? "不通过" : "通过";
   }
-  report.findings = findings.map((f, i) => ({
-    ...findingTemplate(),
-    ...f,
-    id: f.id || `F${i + 1}`,
-    severity: FINDING_SEVERITIES.includes(f.severity) ? f.severity : "P2",
-    confidence: typeof f.confidence === "number" ? Math.max(0, Math.min(1, f.confidence)) : 0.7,
-    evidence_level: EVIDENCE_LEVELS.includes(f.evidence_level) ? f.evidence_level : "unverified",
-    // 测试证伪的发现降级：问题不成立则至少降为 P3 且不入 blockers
-  }));
+  report.findings = findings.map((f, i) => {
+    const cat = primaryPerspectiveId(f.category) || primaryPerspectiveId(f.dimension) || "";
+    const dim = DIMENSIONS.includes(cat) ? cat : (DIMENSIONS.includes(f.dimension) ? f.dimension : (cat || "correctness"));
+    return {
+      ...findingTemplate(),
+      ...f,
+      id: f.id || `F${i + 1}`,
+      severity: FINDING_SEVERITIES.includes(f.severity) ? f.severity : "P2",
+      category: cat || String(f.category || ""),
+      dimension: dim,
+      confidence: typeof f.confidence === "number" ? Math.max(0, Math.min(1, f.confidence)) : 0.7,
+      evidence_level: EVIDENCE_LEVELS.includes(f.evidence_level) ? f.evidence_level : "unverified",
+    };
+  });
   // 修复档防线：repairJson 救活的截断报告可能带残缺 finding（缺 title——
   // findings 数组中途截断后被补闭合）。无标题条目没有审查价值且无法呈现，
   // 丢弃并记录降级声明；evidence 缺失不丢（模型本可省略，有默认值语义）
@@ -435,7 +442,9 @@ export function normalizeReport(raw) {
   const prevFindingsArr = Array.isArray(report.review?.previous_findings) ? report.review.previous_findings : [];
   if (report.review) report.review.previous_findings = prevFindingsArr;
   report.metrics = {
-    perspectives_covered: declaredCovered ?? [...new Set(report.findings.map((f) => f.category).filter(Boolean))],
+    perspectives_covered: (declaredCovered ?? [...new Set(report.findings.map((f) => f.category).filter(Boolean))])
+      .map((id) => primaryPerspectiveId(id) || id)
+      .filter(Boolean),
     perspectives_skipped: declaredSkipped ?? [],
     new_findings: report.findings.length,
     prev_fixed: prevFindingsArr.filter((p) => p.status === "fixed").length,
