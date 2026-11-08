@@ -14,7 +14,7 @@ import { mkdir, writeFile, rm, rename, readdir } from "node:fs/promises";
 import path from "node:path";
 import { resolvePr, parsePrUrl } from "../pr-resolver.js";
 import { runCrTurn } from "./pi-runner.js";
-import { normalizeReport, applyProgrammaticDemotion } from "./report-schema.js";
+import { normalizeReport, applyProgrammaticDemotion, coerceStringifiedJsonFields, coerceFindingLine } from "./report-schema.js";
 import { buildSystemPrompt, buildFastSystemPrompt, buildFullReviewUserPrompt, buildIncrementalUserPrompt } from "./prompts.js";
 import { Ledger } from "./ledger.js";
 import { routeByFileTypes } from "./routing.js";
@@ -186,14 +186,16 @@ export class CrWorkflow {
     }
 
     // ── 1) 触发 & 解析 PR（withRepo：源码树落盘 workDir/repo，供 agent read/grep 未改动代码） ──
+    // workDir/reportId 提升到 try 外：finally 归档与清理都要用；mkdir/resolvePr 也必须在 try 内，
+    // 否则 resolve 失败会泄漏空工作区（注释承诺「任何失败路径都清理」）
+    let workDir = null;
+    let reportId = null;
+    try {
     this.emit({ stage: "resolve", status: "start", prUrl });
     // workDir 命名在 pr 声明之前：从 URL 提取 repo/pr（容错：解析失败退化为时间戳）
     const nameHint = prUrl.match(/\/([^/]+)\/pull-requests\/(\d+)/) || prUrl.match(/([^/]+)\/(\d+)/);
-    const workDir = path.join(this.dataDir, "workspaces", `${(nameHint ? nameHint[1].replace(/\.git$/, "") : "pr").replace(/\//g, "_")}-${nameHint ? nameHint[2] : Date.now()}-${Date.now()}`);
+    workDir = path.join(this.dataDir, "workspaces", `${(nameHint ? nameHint[1].replace(/\.git$/, "") : "pr").replace(/\//g, "_")}-${nameHint ? nameHint[2] : Date.now()}-${Date.now()}`);
     await mkdir(workDir, { recursive: true });
-    // reportId 提升到 try 外：finally 里 audit 归档要用（try 块内 const 对 finally 不可见，
-    // 旧版 rename 参数求值抛 ReferenceError 被 catch 吞掉 → .cr-agent 随 workDir 被删，归档从未生效）
-    let reportId = null;
     const pr = await resolvePr(prUrl, settings, { withRepo: path.join(workDir, "repo") });
     this.emit({ stage: "resolve", status: "done", pr: { repo: pr.repo, number: pr.pr, title: pr.meta?.title }, head: pr.meta?.head || null });
 
@@ -204,7 +206,6 @@ export class CrWorkflow {
     // 幂等门：同一 head 审过至少一轮且未勾强制全量 → 不重跑（代码未变，重跑大概率得到近似结果且烧轮次预算）
     if (!options.forceFull && ledger.round > 0 && head && ledger.lastHead && head === ledger.lastHead) {
       this.emit({ stage: "mode", status: "done", mode: "unchanged", round: ledger.round, headUnchanged: true });
-      rm(workDir, { recursive: true, force: true }).catch(() => {});
       const err = new Error(`PR 无新提交（head 未变化，上次审查为第 ${ledger.round} 轮）；如需重审请勾选「强制全量重审」`);
       err.status = 409; err.headUnchanged = true;
       throw err;
@@ -217,8 +218,6 @@ export class CrWorkflow {
     this.emit({ stage: "mode", status: "done", mode, round: ledger.round + 1 });
 
     // ── 3) 准备 agent 工作区（diff 落盘供工具查看；源码树已 checkout 到 workDir/repo） ──
-    // ── 主体 try/finally：任何失败路径都清理临时工作区，避免 workspaces 磁盘泄漏 ──
-    try {
     await writeFile(path.join(workDir, "PR.diff"), pr.diff || "");
     // GitHub 的 meta.commits 是次数（数字）；只有数组形态才落盘提交列表
     if (Array.isArray(pr.meta?.commits)) await writeFile(path.join(workDir, "PR_COMMITS.txt"), pr.meta.commits.map((c) => (typeof c === "string" ? c : JSON.stringify(c))).join("\n"));
@@ -273,6 +272,29 @@ export class CrWorkflow {
     const bundleMeta = bundles ? bundles.map((b, i) => ({ idx: i + 1, files: b.map((f) => f.path) })) : null;
     this.emit({ stage: "schedule", status: "done", fastPath, diffLines, changedLines, bundled: !!bundles, bundles: bundleMeta?.length || 0, model: modelId, thinking: thinkingLevel });
 
+    // progress / audit 排障：截断后的模型原文（脱敏）；全文落盘 .cr-agent/raw-*.json
+    const RAW_TEXT_HEAD = 4000;
+    const persistAgentRaw = async (wd, payload) => {
+      try {
+        const dir = path.join(wd, ".cr-agent");
+        await mkdir(dir, { recursive: true });
+        const name = `raw-${payload.kind}-b${payload.bundleIdx ?? 0}-a${payload.attempt}.json`;
+        const file = path.join(dir, name);
+        const body = {
+          at: new Date().toISOString(),
+          kind: payload.kind,
+          bundleIdx: payload.bundleIdx ?? null,
+          attempt: payload.attempt,
+          error: payload.error || null,
+          textLen: (payload.text || "").length,
+          text: payload.text || "",
+          diagnostics: payload.diagnostics || null,
+        };
+        await writeFile(file, redact(JSON.stringify(body, null, 2), secrets));
+        return name;
+      } catch { return null; }
+    };
+
     // ── 4+5) Agent 执行 + 结论生成（双通道：submit_review 工具对象直传优先，文本 JSON 解析兜底；分桶时逐桶执行后确定性合并） ──
     const runOneTurn = async (ctx) => {
       const { systemPrompt, userPrompt, workDir: wd } = ctx;
@@ -284,25 +306,77 @@ export class CrWorkflow {
         // 只转发低频关键事件：message_update 是逐 token 高频流水（每分钟数千条），
         // 打爆进度事件数组（MAX_EVENTS）导致进度接口"装死"被误判为断流
         const noisy = new Set(["message_update"]);
-        const { text, usage, toolCalls, submittedReport } = await runCrTurn({
-          settings, dataDir: this.dataDir, workDir: wd, bundleIdx: ctx.bundleIdx,
-          systemPrompt, userPrompt: userPrompt + extra,
-          model: modelId, thinkingLevel,
-          onEvent: (e) => {
-            const type = e?.type;
-            if (noisy.has(type)) return;
-            this.emit({ stage: "agent-event", event: { type }, bundle: ctx.bundleIdx });
-          },
-        });
+        let text = "";
+        let usage = null;
+        let toolCalls = 0;
+        let submittedReport = null;
+        try {
+          ({ text, usage, toolCalls, submittedReport } = await runCrTurn({
+            settings, dataDir: this.dataDir, workDir: wd, bundleIdx: ctx.bundleIdx,
+            systemPrompt, userPrompt: userPrompt + extra,
+            model: modelId, thinkingLevel,
+            onEvent: (e) => {
+              const type = e?.type;
+              if (noisy.has(type)) return;
+              this.emit({ stage: "agent-event", event: { type }, bundle: ctx.bundleIdx });
+            },
+          }));
+        } catch (e) {
+          // 空响应（带 diagnostics）或其它会话异常（超时等）：progress + audit 落盘可复查
+          const diagnostics = e?.diagnostics || null;
+          const status = diagnostics ? "empty-response" : "agent-fail";
+          const headFromParts = (diagnostics?.lastAssistant?.parts || [])
+            .map((p) => p.textHead || p.thinkingHead || "")
+            .filter(Boolean)
+            .join("\n");
+          const rawName = await persistAgentRaw(wd, {
+            kind: status,
+            bundleIdx: ctx.bundleIdx,
+            attempt,
+            text: headFromParts,
+            error: e?.message || String(e),
+            diagnostics,
+          });
+          this.emit({
+            stage: "agent",
+            status,
+            attempt,
+            bundle: ctx.bundleIdx,
+            error: e?.message || String(e),
+            textLen: headFromParts.length,
+            textHead: redact(headFromParts.slice(0, RAW_TEXT_HEAD), secrets),
+            diagnostics,
+            rawFile: rawName,
+          });
+          throw e;
+        }
         // 通道 1：submit_review 工具提交（对象直传，无字符串解析环节；strict 端点下参数解码层受语法约束）
         if (submittedReport && typeof submittedReport === "object") {
           try {
-            const rep = normalizeReport(submittedReport);
+            // 工具通道再解一层 stringify（与 submit_review execute / normalizeReport 同款），防旧会话/漏网字段
+            const rep = normalizeReport(coerceStringifiedJsonFields(submittedReport));
             rep._usage = usage; rep._toolCalls = toolCalls; rep._submitted = true;
             return rep;
           } catch (e) {
             // 工具参数也应校验失败兜底（strict 不支持端点模型可能塞非法枚举）：走文本通道重试
-            this.emit({ stage: "agent", status: "parse-fail", attempt, bundle: ctx.bundleIdx, error: `submit_review 参数校验失败：${e.message}` });
+            const dumped = (() => { try { return JSON.stringify(submittedReport); } catch { return String(submittedReport); } })();
+            const rawName = await persistAgentRaw(wd, {
+              kind: "submit-normalize-fail",
+              bundleIdx: ctx.bundleIdx,
+              attempt,
+              text: dumped,
+              error: e.message,
+            });
+            this.emit({
+              stage: "agent",
+              status: "parse-fail",
+              attempt,
+              bundle: ctx.bundleIdx,
+              error: `submit_review 参数校验失败：${e.message}`,
+              textLen: dumped.length,
+              textHead: redact(dumped.slice(0, RAW_TEXT_HEAD), secrets),
+              rawFile: rawName,
+            });
           }
         }
         try {
@@ -314,8 +388,26 @@ export class CrWorkflow {
           catch (e) { this.emit({ stage: "agent", status: "persist-fail", bundle: ctx.bundleIdx, error: String(e.message || e) }); }
           return rep;
         } catch (e) {
+          const rawName = await persistAgentRaw(wd, {
+            kind: "parse-fail",
+            bundleIdx: ctx.bundleIdx,
+            attempt,
+            text: text || "",
+            error: e.message,
+          });
+          this.emit({
+            stage: "agent",
+            status: "parse-fail",
+            attempt,
+            bundle: ctx.bundleIdx,
+            error: e.message,
+            textLen: (text || "").length,
+            textHead: redact((text || "").slice(0, RAW_TEXT_HEAD), secrets),
+            toolCalls,
+            submitted: !!submittedReport,
+            rawFile: rawName,
+          });
           if (attempt >= MAX_JSON_RETRIES) throw new Error(`模型输出无法解析为 JSON 报告（末次输出开头：${(text || "").slice(0, 120)}）：${e.message}`);
-          this.emit({ stage: "agent", status: "parse-fail", attempt, bundle: ctx.bundleIdx, error: e.message });
         }
       }
     };
@@ -338,9 +430,8 @@ export class CrWorkflow {
     // finding 的 file:line 不在本次新增行（+ 行）上 → 存量代码，标记并由 normalize 兑底降级
     const markPreExisting = (rep) => {
       for (const f of rep.findings || []) {
-        // 行号数值化：模型可能输出 "13"（字符串），isChangedLine 的 Number.isInteger 检查会静默跳过
-        const n = Number(f.line);
-        f.line = Number.isInteger(n) ? n : null;
+        // 行号数值化：跳过 null（Number(null)===0 会误判存量）；模型可能输出 "13" 字符串
+        f.line = coerceFindingLine(f.line);
         // 校正过的行号（line_adjusted）本身不可信：被钉到 hunk 头的位置不能作为存量判定依据
         if (f.line == null || f.line_adjusted) continue;
         const onAdded = isChangedLine(files, f.file, f.line);
@@ -360,11 +451,12 @@ export class CrWorkflow {
       const allPaths = files.map((f) => f.path);
       const concurrency = Math.max(1, Math.min(8, Number(settings.bundleConcurrency) || 1));
       const subReports = new Array(bundles.length);
+      const bundleErrors = [];
       let next = 0;
-      let poolFailed = false;  // 级联取消：任一桶失败后不再取新桶（已抛错等待 Promise.all 收敛，剩余桶不再烧 token）
+      // fail-soft：单桶失败不拖死整单（此前 6/7 成功仍因末桶散文无法 JSON 整单报废）；
+      // 成功桶照常合并，失败桶记入 verification.degraded_steps / review_bundles。
       const worker = async () => {
         while (true) {
-          if (poolFailed) return;
           const bi = next++;
           if (bi >= bundles.length) return;
           const b = bundles[bi];
@@ -375,25 +467,38 @@ export class CrWorkflow {
             // 共享头：全 PR 文件清单（让桶知道还有别的桶，防只见树木）
             otherFiles: allPaths.filter((p) => !paths.includes(p)),
           };
-          const sub = await runOneTurn({
-            systemPrompt: fastPath ? buildFastSystemPrompt() : buildSystemPrompt(),
-            userPrompt: (mode === "incremental"
-              ? buildIncrementalUserPrompt(bundleCtx)
-              : buildFullReviewUserPrompt(bundleCtx)) + `\n\n【分桶说明】本次是分治审查的第 ${bi + 1}/${bundles.length} 桶，你只审以上文件；其他文件由并行会话负责，不要报告它们的未变化部分。`,
-            workDir, bundleIdx: bi + 1,
-          });
-          subReports[bi] = sub;
+          try {
+            const sub = await runOneTurn({
+              systemPrompt: fastPath ? buildFastSystemPrompt() : buildSystemPrompt(),
+              userPrompt: (mode === "incremental"
+                ? buildIncrementalUserPrompt(bundleCtx)
+                : buildFullReviewUserPrompt(bundleCtx)) + `\n\n【分桶说明】本次是分治审查的第 ${bi + 1}/${bundles.length} 桶，你只审以上文件；其他文件由并行会话负责，不要报告它们的未变化部分。`,
+              workDir, bundleIdx: bi + 1,
+            });
+            subReports[bi] = sub;
+          } catch (e) {
+            const msg = e?.message || String(e);
+            bundleErrors.push({ idx: bi + 1, error: msg });
+            subReports[bi] = null;
+            this.emit({ stage: "agent", status: "bundle-fail", bundle: bi + 1, error: msg });
+          }
         }
       };
-      await Promise.all(Array.from({ length: Math.min(concurrency, bundles.length) }, () => worker().catch((e) => { poolFailed = true; throw e; })));
-      // finding.file 归一化 + 行号校验（位置漂移防线）
+      await Promise.all(Array.from({ length: Math.min(concurrency, bundles.length) }, () => worker()));
+      const okCount = subReports.filter(Boolean).length;
+      if (!okCount) {
+        const detail = bundleErrors.map((e) => `b${e.idx}:${e.error}`).join(" | ").slice(0, 500);
+        throw new Error(`全部分桶失败（${bundleErrors.length}/${bundles.length}）：${detail}`);
+      }
+      // finding.file 归一化 + 行号校验（位置漂移防线）；跳过失败桶空洞
       for (const sub of subReports) {
+        if (!sub) continue;
         normalizeFindingFile(sub);
         validateLines(sub);
         markPreExisting(sub);
       }
-      // 确定性合并（纯程序化，非模型）：findings 拼接 + Jaccard 去重 + 取最严结论
-      report = mergeReports(subReports, { bundles: bundleMeta }, dedupeFindings);
+      // 确定性合并（纯程序化，非模型）：findings 拼接 + Jaccard 去重 + 取最严结论；失败桶空洞跳过
+      report = mergeReports(subReports, { bundles: bundleMeta, bundleErrors }, dedupeFindings);
       // provenance 全局裁决：合并后的 findings 用全 PR 的 files 重跑存量判定
       //（桶间对同一问题可能给出不同 introduced_by，去重合并只保留首个——以全局行号证据统一）
       markPreExisting(report);
@@ -412,10 +517,11 @@ export class CrWorkflow {
       applyAnchorSeverity(report, sevRules);
       if (sevNote) { report.verification = report.verification || {}; report.verification.degraded_steps = [...(report.verification.degraded_steps || []), sevNote]; }
       report._severity_rules = sevRules.map((r) => r.id).join(",");
-      report._usage = { bundles: subReports.map((r) => r._usage) };
-      report._toolCalls = subReports.reduce((a, r) => a + (r._toolCalls || 0), 0);
+      report._usage = { bundles: subReports.map((r) => r?._usage || null) };
+      report._toolCalls = subReports.reduce((a, r) => a + (r?._toolCalls || 0), 0);
       // submit_review 工具通道生效统计（每桶是否经工具交付而非文本解析）
-      report._submittedBundles = subReports.reduce((a, r) => a + (r._submitted ? 1 : 0), 0);
+      report._submittedBundles = subReports.reduce((a, r) => a + (r?._submitted ? 1 : 0), 0);
+      report._failedBundles = bundleErrors.length;
       // P0/P1 verifier 回路：独立会话复核证据链（fail-open）
       await this._runVerifier(report, settings, workDir, modelId, { repo: pr.repo, pr: pr.pr, title: pr.meta?.title });
     } else {
@@ -467,27 +573,26 @@ export class CrWorkflow {
     };
 
     // ── 截断/降级声明：diff 截断与拉取降级如实声明（防静默漏审） ──
+    const pushDegraded = (note) => {
+      report.verification = report.verification && typeof report.verification === "object" && !Array.isArray(report.verification)
+        ? report.verification : {};
+      const prev = Array.isArray(report.verification.degraded_steps) ? report.verification.degraded_steps : [];
+      report.verification.degraded_steps = [...prev, note];
+    };
     if (diffEmpty) {
-      if (!Array.isArray(report.verification?.degraded_steps)) report.verification = { ...(report.verification || {}) };
-      report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-        `diff 无内容行（拉取退化或 PR 无变更）：本报告基于无 diff 的全仓检查，未做变更行级审查，结论不可作为发布依据`];
+      pushDegraded(`diff 无内容行（拉取退化或 PR 无变更）：本报告基于无 diff 的全仓检查，未做变更行级审查，结论不可作为发布依据`);
     }
     const maxDiffChars = Number.isInteger(settings.maxDiffChars) && settings.maxDiffChars > 0 ? settings.maxDiffChars : 400000;
     if ((pr.diff || "").length > maxDiffChars) {
-      if (!Array.isArray(report.verification?.degraded_steps)) report.verification = { ...(report.verification || {}) };
-      report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-        `diff 超过 maxDiffChars（${(pr.diff || "").length}/${maxDiffChars}），提示词中被截断；完整 diff 已落盘工作区 PR.diff，仅当 agent 未主动 read 查看时存在漏审风险`];
+      pushDegraded(`diff 超过 maxDiffChars（${(pr.diff || "").length}/${maxDiffChars}），提示词中被截断；完整 diff 已落盘工作区 PR.diff，仅当 agent 未主动 read 查看时存在漏审风险`);
     }
     // GitLab >10 页 diff 条目截断（meta.diff_truncated 由 pr-resolver 声明）
     if (pr.meta?.diff_truncated) {
-      if (!Array.isArray(report.verification?.degraded_steps)) report.verification = { ...(report.verification || {}) };
-      report.verification.degraded_steps = [...(report.verification.degraded_steps || []), pr.meta.diff_truncated];
+      pushDegraded(pr.meta.diff_truncated);
     }
     // API 拉取失败走 git 兜底（resolveErrors 由 pr-resolver 收集）：声明降级与 base 语义差异
     if (Array.isArray(pr.resolveErrors) && pr.resolveErrors.length) {
-      if (!Array.isArray(report.verification?.degraded_steps)) report.verification = { ...(report.verification || {}) };
-      report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-        `PR 拉取降级：${pr.resolveErrors.join("；")}（diff 来自 git 兜底，base 可能退化为 prhead~1，审查范围可能缩小）`];
+      pushDegraded(`PR 拉取降级：${pr.resolveErrors.join("；")}（diff 来自 git 兜底，base 可能退化为 prhead~1，审查范围可能缩小）`);
     }
 
     // ── 7) 迭代闭环：入账 ──
@@ -516,23 +621,25 @@ export class CrWorkflow {
       // 清理临时工作区（报告已含全部证据；失败路径同样清理，避免 workspaces 磁盘泄漏）。
       // 审计快照保留：submit_review 落盘的 .cr-agent/report.json 先归档到 reports 目录旁
       //（工具通道物证 + 调试用；rename 移动而非拷贝，清不掉也不影响主流程）
-      try {
-        const auditSrc = path.join(workDir, ".cr-agent");
-        await mkdir(path.join(this.dataDir, "reports", "audit"), { recursive: true });
-        // 归档前脱敏：两条通道的 report-bundle-N.json 落盘发生在主报告 redact 之前，
-        // 提示注入诱导的凭证泄漏会原样进入 audit 归档——虽未被 API 暴露，仍按同一防线处理
+      if (workDir) {
         try {
-          for (const name of await readdir(auditSrc).catch(() => [])) {
-            if (!name.endsWith(".json")) continue;
-            const auditFile = path.join(auditSrc, name);
-            const raw = await readFile(auditFile, "utf8");
-            const clean = redact(raw, secrets);
-            if (clean !== raw) await writeFile(auditFile, clean);
-          }
-        } catch { /* 脱敏失败不阻断归档（归档物证优先），rename 照常 */ }
-        await rename(auditSrc, path.join(this.dataDir, "reports", "audit", `${reportId || Date.now()}`)).catch(() => {});
-      } catch { /* 归档失败不阻断清理 */ }
-      rm(workDir, { recursive: true, force: true }).catch(() => {});
+          const auditSrc = path.join(workDir, ".cr-agent");
+          await mkdir(path.join(this.dataDir, "reports", "audit"), { recursive: true });
+          // 归档前脱敏：两条通道的 report-bundle-N.json 落盘发生在主报告 redact 之前，
+          // 提示注入诱导的凭证泄漏会原样进入 audit 归档——虽未被 API 暴露，仍按同一防线处理
+          try {
+            for (const name of await readdir(auditSrc).catch(() => [])) {
+              if (!name.endsWith(".json")) continue;
+              const auditFile = path.join(auditSrc, name);
+              const raw = await readFile(auditFile, "utf8");
+              const clean = redact(raw, secrets);
+              if (clean !== raw) await writeFile(auditFile, clean);
+            }
+          } catch { /* 脱敏失败不阻断归档（归档物证优先），rename 照常 */ }
+          await rename(auditSrc, path.join(this.dataDir, "reports", "audit", `${reportId || Date.now()}`)).catch(() => {});
+        } catch { /* 归档失败不阻断清理 */ }
+        rm(workDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   }
 }

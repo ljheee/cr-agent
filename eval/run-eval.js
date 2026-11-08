@@ -77,7 +77,14 @@ if (isMain) {
     const reportPath = args[args.indexOf("--report") + 1];
     const report = normalizeReport(readFileSync(reportPath, "utf8"));
     const fixtureName = args.includes("--fixture") ? args[args.indexOf("--fixture") + 1] : null;
-    const fx = loadFixtures().find((f) => f.name === fixtureName) || loadFixtures()[0];
+    const all = loadFixtures();
+    let fx;
+    if (fixtureName) {
+      fx = all.find((f) => f.name === fixtureName);
+      if (!fx) throw new Error(`fixture 不存在: ${fixtureName}`);
+    } else {
+      fx = all[0];
+    }
     console.log(JSON.stringify(score(fx, report), null, 2));
   } else {
     const checks = selfCheck();

@@ -371,6 +371,9 @@ export async function fetchPrViaGit(parsed, settings, opts = {}) {
     // 空 diff 防线会 throw，若 checkout 放在那之后，源码树永远落不了盘）
     if (keepRepo) {
       await exec("git", ["checkout", "-q", "prhead"], { cwd: dir, env });
+      // 凭证不落盘：fetch 完成后把 origin 改写为无 token URL（agent 只需本地树；.git/config 不再残留 PAT）
+      const cleanOrigin = gitUrlFor(parsed, { ...settings, platformTokens: {} });
+      await exec("git", ["remote", "set-url", "origin", cleanOrigin], { cwd: dir, env }).catch(() => {});
     }
     // merge-base 与 diff：fetch 主分支做 base（尽力而为）
     // 注意：`git fetch origin <branch>` 只创建 refs/remotes/origin/<branch>，不创建本地 <branch> ref，
@@ -418,7 +421,7 @@ export async function fetchPrViaGit(parsed, settings, opts = {}) {
  * 主入口：解析链接并获取 diff（API 优先，git 兜底）。
  */
 export async function resolvePr(url, settings, opts = {}) {
-  const parsed = parsePrUrl(url);
+  const parsed = parsePrUrl(url, settings);
   const { withRepo } = opts; // withRepo：源码树落盘目录；提供时 git 通道把仓库 checkout 到该目录（diff 仍走 API 优先）
   let result = null, errors = [];
   if (settings?.usePlatformApi !== false) {

@@ -113,7 +113,7 @@ export function applyVerifierVerdicts(report, verdicts) {
         res.downgraded.push(`${f.id} ${f.severity}→P2`);
         f.severity = "P2";
         f._verifier = { verdict, reason };
-      } else { res.maintained++; f._verifier = { verdict: "confirmed", reason: "复核降级请求但已低于 P1，维持" }; }
+      } else { res.maintained++; f._verifier = { verdict: "downgrade", applied: false, reason: "复核降级请求但已低于 P1，维持" }; }
     } else {
       res.voided.push(`${f.id} ${String(f.title || "").slice(0, 30)}`);
       f._verifier = { verdict, reason };

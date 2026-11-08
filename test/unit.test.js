@@ -523,6 +523,29 @@ test("mergeReports: 确定性合并 + 取最严结论 + 去重 + 重建 author_s
   assert.equal(merged.review_bundles.length, 2);
 });
 
+test("mergeReports: 失败桶空洞 fail-soft 合并 + degraded_steps 留痕", () => {
+  const sub1 = normalizeReport(JSON.stringify({
+    conclusion: "通过", one_line: "桶1 ok", findings: [
+      { id: "F1", title: "小问题", severity: "P2", file: "a.js", suggestion: "s", category: "logic" },
+    ], checked_paths: ["a.js"],
+  }));
+  const merged = mergeReports(
+    [sub1, null, null],
+    { bundles: [{ idx: 1, files: ["a.js"] }, { idx: 2, files: ["b.js"] }, { idx: 3, files: ["c.js"] }],
+      bundleErrors: [{ idx: 2, error: "parse-fail prose" }, { idx: 3, error: "empty" }] },
+    dedupeFindings,
+  );
+  assert.equal(merged.conclusion, "通过");
+  assert.equal(merged.findings.length, 1);
+  assert.equal(merged.metrics.bundles, 3);
+  assert.equal(merged.metrics.bundles_ok, 1);
+  assert.equal(merged.metrics.bundles_failed, 2);
+  assert.equal(merged.review_bundles[0].failed, false);
+  assert.equal(merged.review_bundles[1].failed, true);
+  assert.ok(merged.verification.degraded_steps.some((s) => /分桶 2 失败/.test(s)));
+  assert.throws(() => mergeReports([null, null], { bundleErrors: [{ idx: 1, error: "x" }] }), /子报告为空/);
+});
+
 /* ───────── subagent CR 第二轮修复回归 ───────── */
 
 test("ledger: needs_human 不被 still_exists 降级 + trace 查证成功关闭", async () => {
@@ -634,29 +657,23 @@ test("ledger: previous_findings 只按 persist_id 匹配（F 编号回显不误�
 });
 
 test("workflow._run: 最小集成（mock fetch + 注入 runCrTurn，防 TDZ 回归）", async () => {
-  const { CrWorkflow } = await import("../src/engine/workflow.js");
-  const settings = { get: () => ({ defaultModel: "m1", defaultThinking: "high", maxDiffChars: 400000, models: [{ id: "m1" }] }) };
-  const events = [];
-  const wf = new CrWorkflow({ dataDir: await mkdtemp("/tmp/cr-wf-"), settings, emit: (e) => events.push(e) });
-
-  // mock resolvePr 的 fetch（GitHub API）+ 注入 runCrTurn
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => ({
-    ok: true, status: 200, json: async () => ({ title: "t", user: { login: "u" }, head: { sha: "h1" }, base: { sha: "b1" }, files: 1 }),
-    text: async () => "diff --git a/x.js b/x.js\n@@ -1,2 +1,3 @@\n context\n+new\n-old",
-  });
-  const wfMod = await import("../src/engine/workflow.js");
-  // runCrTurn 是 pi-runner 命名导出且被 workflow 静态 import —— 通过临时替换全局 fetch 已够触发 TDZ；
-  // 但 agent 调用需要真实模型，这里用 module mock：拦截 pi-runner
-  const piRunner = await import("../src/engine/pi-runner.js");
-  const origRun = piRunner.runCrTurn;
-  // ESM 命名导出不可变，改用子类注入：直接测 workflow 内部对 files 的 TDZ —— 通过 eval 源码检查
-  globalThis.fetch = origFetch;
-  // 源码级断言：files 声明必须先于一切使用（TDZ 防回归）
-  const src = (await import("node:fs")).readFileSync(new URL("../src/engine/workflow.js", import.meta.url), "utf8");
-  const declIdx = src.indexOf("const files = parseFiles");
-  const useIdx = src.indexOf("filesChangedList = files.length");
-  assert.ok(declIdx >= 0 && useIdx > 0 && declIdx < useIdx, "files 声明必须先于 filesChangedList 使用（TDZ）");
+  const dataDir = await mkdtemp("/tmp/cr-wf-");
+  try {
+    const { CrWorkflow } = await import("../src/engine/workflow.js");
+    const settings = { get: () => ({ defaultModel: "m1", defaultThinking: "high", maxDiffChars: 400000, models: [{ id: "m1" }] }) };
+    const events = [];
+    const wf = new CrWorkflow({ dataDir, settings, emit: (e) => events.push(e) });
+    void wf; // 构造可实例化
+    // 源码级断言：files 声明必须先于一切使用（TDZ 防回归）；resolvePr 在 try 内（防 workDir 泄漏）
+    const src = (await import("node:fs")).readFileSync(new URL("../src/engine/workflow.js", import.meta.url), "utf8");
+    const declIdx = src.indexOf("const files = parseFiles");
+    const useIdx = src.indexOf("filesChangedList = files.length");
+    assert.ok(declIdx >= 0 && useIdx > 0 && declIdx < useIdx, "files 声明必须先于 filesChangedList 使用（TDZ）");
+    assert.ok(src.indexOf("await resolvePr(") > src.indexOf("let workDir = null"), "resolvePr 在 try/workDir 声明之后");
+    assert.ok(src.includes("coerceFindingLine"), "markPreExisting 使用 coerceFindingLine");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 /* ───────── P1/P2 落地回归 ───────── */
@@ -959,12 +976,18 @@ test("pi-models: buildModelsJson 与 pi-runner 转发导出一致（测试离线
 /* ───────── v20：submit_review 工具通道 + jsonrepair 兜底 + 流式早停 ───────── */
 
 test("submit_review 工具：schema 合法性 + execute 落盘 + terminate + 回调", async () => {
-  const { createSubmitReviewTool, buildSubmitReviewSchema } = await import("../src/engine/submit-review-tool.js");
+  const { createSubmitReviewTool, buildSubmitReviewSchema, normalizePerspectivesSkipped } = await import("../src/engine/submit-review-tool.js");
   const schema = buildSubmitReviewSchema();
   assert.equal(schema.type, "object");
   assert.ok(schema.properties.conclusion && schema.properties.findings && schema.properties.one_line);
   // finding 参数是 strict 兼容的普通 object schema
   assert.equal(schema.properties.findings.items.type, "object");
+  // perspectives_skipped 放宽为 Any[]（TypeBox Any → items:{}），兼容误传的 {id,reason}
+  assert.deepEqual(schema.properties.perspectives_skipped.items, {});
+  assert.deepEqual(
+    normalizePerspectivesSkipped([{ id: "frontend", reason: "无前端" }, "mq: 无消息", { id: "build" }]),
+    ["frontend: 无前端", "mq: 无消息", "build"],
+  );
 
   let captured = null;
   const dir = await mkdtemp("/tmp/cr-submit-");
@@ -980,11 +1003,33 @@ test("submit_review 工具：schema 合法性 + execute 落盘 + terminate + 回
   };
   const res = await tool.execute("call-1", report, undefined, undefined, {});
   assert.equal(res.terminate, true, "工具返回 terminate:true（agent 循环即停）");
-  assert.equal(captured, report, "onSubmitted 回调收到报告对象");
+  assert.deepEqual(captured, report, "onSubmitted 回调收到报告对象（coerce 会浅拷贝，用 deepEqual）");
   const { readFile } = await import("node:fs/promises");
   const saved = JSON.parse(await readFile(`${dir}/.cr-agent/report.json`, "utf8"));
   assert.equal(saved.conclusion, "通过");
   assert.equal(saved.findings.length, 1);
+
+  // 对象形态 perspectives_skipped 不被拒，execute 内压成字符串
+  let captured2 = null;
+  const tool2 = createSubmitReviewTool({ workDir: dir, onSubmitted: (r) => { captured2 = r; } });
+  await tool2.execute("call-2", {
+    ...report,
+    perspectives_skipped: [{ id: "frontend", reason: "无前端变更" }],
+  }, undefined, undefined, {});
+  assert.deepEqual(captured2.perspectives_skipped, ["frontend: 无前端变更"]);
+
+  // 嵌套字段被二次 stringify 时，execute 侧解成对象再回调/落盘
+  let captured3 = null;
+  const tool3 = createSubmitReviewTool({ workDir: dir, bundleIdx: 1, onSubmitted: (r) => { captured3 = r; } });
+  await tool3.execute("call-3", {
+    conclusion: "通过",
+    one_line: "字符串化嵌套",
+    findings: "[]",
+    review: JSON.stringify({ summary: "ok", perspectives: [] }),
+  }, undefined, undefined, {});
+  assert.ok(Array.isArray(captured3.findings));
+  assert.equal(typeof captured3.review, "object");
+  assert.equal(captured3.review.summary, "ok");
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1005,6 +1050,40 @@ test("repairJson：缺逗号/尾逗号/单引号/干净截断修复；字符串�
   assert.equal(JSON.parse(repairJson(normal)).a, "x y");
 });
 
+test("normalizeReport：嵌套字段被二次 stringify 时自动解一层", async () => {
+  const { normalizeReport } = await import("../src/engine/report-schema.js");
+  const r = normalizeReport({
+    conclusion: "通过",
+    one_line: "ok",
+    review: JSON.stringify({ mode: "full", previous_findings: [] }),
+    findings: JSON.stringify([{ id: "F1", title: "t", severity: "P2", suggestion: "s", file: "a.js", evidence: "e" }]),
+    tests: JSON.stringify([{ scenario: "x", priority: "low" }]),
+  });
+  assert.equal(r.conclusion, "通过");
+  assert.equal(r.review.mode, "full");
+  assert.equal(r.findings.length, 1);
+  assert.equal(r.findings[0].id, "F1");
+  assert.equal(r.tests.length, 1);
+});
+
+test("snapshotAssistantMessage：截断 text/thinking 供空响应排障", async () => {
+  const { snapshotAssistantMessage } = await import("../src/engine/pi-runner.js");
+  const snap = snapshotAssistantMessage({
+    role: "assistant",
+    stopReason: "stop",
+    content: [
+      { type: "thinking", thinking: "x".repeat(1000) },
+      { type: "text", text: "Now let me review the PR in detail..." },
+      { type: "toolCall", name: "submit_review", id: "c1" },
+    ],
+  }, 20);
+  assert.equal(snap.stopReason, "stop");
+  assert.equal(snap.parts[0].thinkingLen, 1000);
+  assert.equal(snap.parts[0].thinkingHead.length, 20);
+  assert.equal(snap.parts[1].textHead, "Now let me review th");
+  assert.equal(snap.parts[2].toolName, "submit_review");
+});
+
 test("pi-runner 源码级断言：submit_review 通道 + 早停截断存在（防回归）", async () => {
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("../src/engine/pi-runner.js", import.meta.url), "utf8");
@@ -1012,11 +1091,14 @@ test("pi-runner 源码级断言：submit_review 通道 + 早停截断存在（�
   assert.ok(src.includes("customTools: submitReviewTool ? [submitReviewTool] : []"), "customTools 条件注册 submit_review");
   assert.ok(src.includes("wantSubmitTool"), "工具白名单开关存在");
   assert.ok(src.includes("submittedReport"), "runCrTurn 返回 submittedReport");
+  assert.ok(src.includes("err.diagnostics"), "空响应挂 diagnostics");
   // 文本通道早停：message_update 增量平衡扫描
   assert.ok(src.includes('"message_update"') && src.includes("earlyStopped"), "早停扫描存在");
   // workflow 消费双通道
   const wfSrc = await readFile(new URL("../src/engine/workflow.js", import.meta.url), "utf8");
   assert.ok(wfSrc.includes("submittedReport && typeof submittedReport === \"object\""), "workflow 优先工具通道");
+  assert.ok(wfSrc.includes('status: "parse-fail"') && wfSrc.includes("textHead"), "parse-fail 记录 textHead");
+  assert.ok(wfSrc.includes("empty-response") && wfSrc.includes("persistAgentRaw"), "空响应落盘 raw");
   assert.ok(wfSrc.includes("_submitted = true"), "工具通道标记 _submitted");
 });
 
@@ -1478,4 +1560,74 @@ assert.ok(src.includes('agentDirSub: "verifier"'), "独立 pi-home 防与 worker
 const wf = await (await import("node:fs/promises")).readFile(`${process.cwd()}/src/engine/workflow.js`, "utf8");
 assert.ok(wf.includes("fail-open，保留锚点定级"), "verifier 失败 fail-open 留痕");
 assert.ok(wf.includes("verifySnippets(report, path.join(workDir, \"repo\"))"), "snippet 回查接入管线");
+});
+
+/* ───────── CR 报告 ljheee_cr-agent-1-r1-1794148013627 回归 ───────── */
+
+test("CR修复 F16: findingTemplate introduced_by 为字符串非数字 0", async () => {
+  const { findingTemplate, normalizeReport } = await import("../src/engine/report-schema.js");
+  const t = findingTemplate();
+  assert.equal(t.introduced_by, "this-pr");
+  assert.equal(typeof t.introduced_by, "string");
+  assert.notEqual(t.introduced_by, 0);
+  const r = normalizeReport({ conclusion: "通过", one_line: "x", findings: [{ title: "t", severity: "P2", suggestion: "s", file: "a.js" }] });
+  assert.equal(r.findings[0].introduced_by, "this-pr");
+});
+
+test("CR修复 F17: normalizeReport(null) 抛可读错误而非 TypeError", async () => {
+  const { normalizeReport } = await import("../src/engine/report-schema.js");
+  assert.throws(() => normalizeReport("null"), /合法 JSON 对象|不是合法/);
+  assert.throws(() => normalizeReport(null), /合法 JSON 对象|不是合法/);
+});
+
+test("CR修复 F11: extractSnippetLines 复合 + 行号前缀", async () => {
+  const { extractSnippetLines } = await import("../src/engine/evidence-verify.js");
+  const lines = extractSnippetLines("+ 12: const fooBarBazQuux = 1;");
+  assert.equal(lines[0], "const fooBarBazQuux = 1;");
+  assert.ok(!lines[0].startsWith("12:"));
+});
+
+test("CR修复 F7: coerceFindingLine 跳过 null/空串，不把 null 变成 0", async () => {
+  const { coerceFindingLine } = await import("../src/engine/report-schema.js");
+  assert.equal(coerceFindingLine(null), null);
+  assert.equal(coerceFindingLine(""), null);
+  assert.equal(coerceFindingLine("13"), 13);
+  assert.equal(coerceFindingLine(0), null);
+  assert.equal(coerceFindingLine(-1), null);
+  assert.equal(coerceFindingLine("x"), null);
+});
+
+test("CR修复 F10: normalizeReport 将字符串 degraded_steps 规范为空数组", async () => {
+  const { normalizeReport } = await import("../src/engine/report-schema.js");
+  const r = normalizeReport({
+    conclusion: "通过", one_line: "x", findings: [], checked_paths: ["a.js"],
+    verification: { degraded_steps: "oops" },
+  });
+  assert.ok(Array.isArray(r.verification.degraded_steps));
+});
+
+test("CR修复 F15: resolvePr 源码把 settings 传给 parsePrUrl", async () => {
+  const src = await (await import("node:fs/promises")).readFile(`${process.cwd()}/src/pr-resolver.js`, "utf8");
+  assert.ok(/const parsed = parsePrUrl\(url,\s*settings\)/.test(src), "resolvePr 必须透传 settings");
+});
+
+test("CR修复 F12: --fixture 不存在时抛错（源码断言）", async () => {
+  const src = await (await import("node:fs/promises")).readFile(`${process.cwd()}/eval/run-eval.js`, "utf8");
+  assert.ok(/fixture 不存在|fixtureName/.test(src) && /throw new Error/.test(src));
+  assert.ok(!/loadFixtures\(\)\.find\(\(f\) => f\.name === fixtureName\) \|\| loadFixtures\(\)\[0\]/.test(src));
+});
+
+test("CR修复 F14: buildModelsJson 空 baseUrl 省略字段", async () => {
+  const { buildModelsJson } = await import("../src/engine/pi-models.js");
+  const m = buildModelsJson({ baseUrl: "", models: [{ id: "m1" }] });
+  assert.equal(m.providers.custom.baseUrl, undefined);
+  assert.ok(!("baseUrl" in m.providers.custom) || m.providers.custom.baseUrl == null || m.providers.custom.baseUrl === undefined);
+});
+
+test("CR修复 F13: downgrade 已低于 P1 时 verdict 保留 downgrade", async () => {
+  const { applyVerifierVerdicts } = await import("../src/engine/verifier.js");
+  const report = { findings: [{ id: "F1", severity: "P2", title: "t" }] };
+  applyVerifierVerdicts(report, [{ id: "F1", verdict: "downgrade", reason: "x" }]);
+  assert.equal(report.findings[0]._verifier.verdict, "downgrade");
+  assert.equal(report.findings[0]._verifier.applied, false);
 });

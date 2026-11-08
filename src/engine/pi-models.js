@@ -20,11 +20,13 @@ export function buildModelsJson(settings) {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
   }));
   if (!models.length) throw new PiRunnerError("设置中没有可用模型，请先在设置页添加");
+  const baseUrl = typeof settings.baseUrl === "string" ? settings.baseUrl.trim() : "";
   return {
     providers: {
       [settings.providerId || "custom"]: {
         name: settings.providerName || "AI Proxy",
-        baseUrl: settings.baseUrl,
+        // SDK ProviderConfigSchema：baseUrl 若出现则 minLength≥1；空串会校验失败且错误被遮蔽
+        ...(baseUrl ? { baseUrl } : {}),
         api: "openai-completions",
         models,
       },

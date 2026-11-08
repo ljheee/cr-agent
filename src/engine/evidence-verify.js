@@ -21,7 +21,8 @@ import path from "node:path";
 export function extractSnippetLines(snippet) {
   return String(snippet || "")
     .split("\n")
-    .map((l) => l.replace(/^\s*\d+\s*[:|]\s?/, "").replace(/^[+-]\s?/, "").trim())
+    // 先剥 diff 符号再剥行号：否则 "+ 12: code" 会残留 "12: code" 导致回查误降 unverified
+    .map((l) => l.replace(/^[+-]\s?/, "").replace(/^\s*\d+\s*[:|]\s?/, "").trim())
     .filter((l) => l.length >= 12 && /[A-Za-z_$]/.test(l))
     .sort((a, b) => b.length - a.length)
     .slice(0, 3);

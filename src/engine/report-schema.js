@@ -42,10 +42,17 @@ export function findingTemplate() {
     evidence_level: "unverified",  // 证据四档：test-confirmed | test-falsified | code-confirmed | unverified
     evidence_gap: "",        // unverified 时必填：缺什么具体条件才能验证
     trace_ids: [],           // 关联的跨仓查证编号
-    introduced_by: "this-pr" | "pre-existing", // 是否本次引入
-    fix_effort: "trivial|small|medium|large",
+    introduced_by: "this-pr", // 是否本次引入（勿写 "a" | "b"：那是位或表达式，运行时变成数字 0）
+    fix_effort: "small",
     exemptible: true,        // 是否可豁免（风格类 P3 默认可豁免）
   };
+}
+
+/** finding.line 数值化：跳过 null/空串；拒绝 0/负数（Number(null)===0 的陷阱） */
+export function coerceFindingLine(line) {
+  if (line == null || line === "") return null;
+  const n = Number(line);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /** 降一档严重级别（P0→P1→P2→P3） */
@@ -256,6 +263,28 @@ export function repairJson(s) {
   return repaired;
 }
 
+/**
+ * 部分模型（尤其 tool-call 参数）会把嵌套对象/数组再次 JSON.stringify 成字符串，
+ * 例如 review: "{\"mode\":\"full\"}"、tests: "[{...}]"。解一层后交给后续规范化。
+ */
+export function coerceStringifiedJsonFields(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const keys = [
+    "review", "impact", "release_plan", "verification", "author_summary",
+    "findings", "changes", "decision_changes", "risks", "tests", "blockers",
+    "checked_paths", "perspectives_covered", "perspectives_skipped",
+  ];
+  const out = { ...raw };
+  for (const k of keys) {
+    const v = out[k];
+    if (typeof v !== "string") continue;
+    const t = v.trim();
+    if (!t || (t[0] !== "{" && t[0] !== "[")) continue;
+    try { out[k] = JSON.parse(t); } catch { /* 保持原字符串，后续逻辑兜底 */ }
+  }
+  return out;
+}
+
 /** 校验 + 规范化模型返回的 JSON（宽容解析） */
 export function normalizeReport(raw) {
   if (typeof raw === "string") {
@@ -303,6 +332,10 @@ export function normalizeReport(raw) {
       }
     }
   }
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("模型报告不是合法 JSON 对象");
+  }
+  raw = coerceStringifiedJsonFields(raw);
   const report = { ...reportTemplate(), ...raw };
   report.schema_version = REPORT_SCHEMA_VERSION;
   // 先规范化 findings（结论兜底依赖它；模型返回非数组时不能先 .some）
@@ -366,6 +399,16 @@ export function normalizeReport(raw) {
   if (report.blockers.length === 0) {
     report.blockers = report.findings.filter((f) => f.severity === "P0" || f.severity === "P1").map((f) => f.id);
   }
+  // verification.* 数组字段兜底：模型若把 degraded_steps 吐成字符串，后续 [...str] 会展开成字符
+  if (!report.verification || typeof report.verification !== "object" || Array.isArray(report.verification)) {
+    report.verification = { ...reportTemplate().verification };
+  } else {
+    report.verification = { ...reportTemplate().verification, ...report.verification };
+  }
+  if (!Array.isArray(report.verification.degraded_steps)) report.verification.degraded_steps = [];
+  if (!Array.isArray(report.verification.traces)) report.verification.traces = [];
+  if (!Array.isArray(report.verification.unverified_upgrades)) report.verification.unverified_upgrades = [];
+
   // author_summary 兜底生成
   if (!raw.author_summary) {
     report.author_summary = buildAuthorSummary(report);
@@ -373,7 +416,20 @@ export function normalizeReport(raw) {
   // 视角覆盖：优先用模型顶层声明的 perspectives_covered/skipped（更真实），
   // 缺失时才用 findings.category 派生（只按有 finding 的视角算会低估覆盖）
   const declaredCovered = Array.isArray(raw.perspectives_covered) ? raw.perspectives_covered : null;
-  const declaredSkipped = Array.isArray(raw.perspectives_skipped) ? raw.perspectives_skipped : null;
+  // 兼容模型误传 {id,reason} 对象：压成 "id: reason" 字符串（与 submit_review 工具侧一致）
+  const declaredSkipped = Array.isArray(raw.perspectives_skipped)
+    ? raw.perspectives_skipped.map((x) => {
+        if (typeof x === "string") return x;
+        if (x && typeof x === "object") {
+          const id = x.id ?? x.perspective ?? "";
+          const reason = x.reason ?? "";
+          if (id && reason) return `${id}: ${reason}`;
+          if (id) return String(id);
+          if (reason) return String(reason);
+        }
+        return x == null ? "" : String(x);
+      }).filter((s) => s.length > 0)
+    : null;
   // 防护：模型返回非数组真值（如 "none"）不 crash（findings/checked_paths 同款兜底）；
   // applyRound/mergeReports 都依赖它可 filter
   const prevFindingsArr = Array.isArray(report.review?.previous_findings) ? report.review.previous_findings : [];
@@ -414,17 +470,22 @@ export function buildAuthorSummary(report) {
  * @param {function} dedupeFn 跨桶去重函数（bundler.dedupeFindings），可注入便于测试
  */
 export function mergeReports(subReports, meta = {}, dedupeFn = null) {
-  if (!subReports.length) throw new Error("mergeReports: 子报告为空");
-  const first = subReports[0];
+  // 允许空洞（fail-soft：某桶失败时槽位为 null）——只合并成功桶；全空则抛错
+  const present = subReports.filter((r) => r && typeof r === "object");
+  if (!present.length) throw new Error("mergeReports: 子报告为空");
+  const first = present[0];
   let fid = 0;
   const findings = [];
   for (const [bi, r] of subReports.entries()) {
+    if (!r) continue;
     for (const f of r.findings || []) {
       findings.push({ ...f, id: `F${++fid}`, bundle: bi + 1 });
     }
   }
   const deduped = dedupeFn ? dedupeFn(findings) : findings;
-  const conclusion = subReports.some((r) => r.conclusion === "不通过") ? "不通过" : "通过";
+  const conclusion = present.some((r) => r.conclusion === "不通过") ? "不通过" : "通过";
+  const failedNotes = (meta.bundleErrors || []).map((e) =>
+    `分桶 ${e.idx} 失败未计入合并：${String(e.error || "").slice(0, 160)}`);
   const merged = {
     ...reportTemplate(),
     schema_version: REPORT_SCHEMA_VERSION,
@@ -432,44 +493,54 @@ export function mergeReports(subReports, meta = {}, dedupeFn = null) {
     pr: first.pr,
     review: { ...(first.review || {}) },
     conclusion,
-    one_line: subReports.map((r) => r.one_line).filter(Boolean).join("；").slice(0, 300) || "",
-    impact_summary: subReports.map((r) => r.impact_summary).filter(Boolean).join("\n").slice(0, 2000),
+    one_line: present.map((r) => r.one_line).filter(Boolean).join("；").slice(0, 300) || "",
+    impact_summary: present.map((r) => r.impact_summary).filter(Boolean).join("\n").slice(0, 2000),
     findings: deduped,
     blockers: deduped.filter((f) => f.severity === "P0" || f.severity === "P1").map((f) => f.id),
     author_summary: null, // 下方重建
     // 数组型字段直接拼接（changes/risks/tests/decision_changes 等）
-    changes: subReports.flatMap((r) => r.changes || []),
+    changes: present.flatMap((r) => r.changes || []),
     impact: {
-      upstream_interfaces: subReports.flatMap((r) => r.impact?.upstream_interfaces || []),
-      downstream_interfaces: subReports.flatMap((r) => r.impact?.downstream_interfaces || []),
-      data_oracle_changes: subReports.flatMap((r) => r.impact?.data_oracle_changes || []),
-      breaking_changes: subReports.flatMap((r) => r.impact?.breaking_changes || []),
+      upstream_interfaces: present.flatMap((r) => r.impact?.upstream_interfaces || []),
+      downstream_interfaces: present.flatMap((r) => r.impact?.downstream_interfaces || []),
+      data_oracle_changes: present.flatMap((r) => r.impact?.data_oracle_changes || []),
+      breaking_changes: present.flatMap((r) => r.impact?.breaking_changes || []),
     },
     decision_changes: subReports.flatMap((r, i) =>
-      (r.decision_changes || []).map((dc) => ({ ...dc, trace_id: dc.trace_id ? `B${i + 1}-${dc.trace_id}` : dc.trace_id }))),
-    risks: subReports.flatMap((r) => r.risks || []),
-    tests: subReports.flatMap((r) => r.tests || []),
+      (!r ? [] : (r.decision_changes || [])).map((dc) => ({ ...dc, trace_id: dc.trace_id ? `B${i + 1}-${dc.trace_id}` : dc.trace_id }))),
+    risks: present.flatMap((r) => r.risks || []),
+    tests: present.flatMap((r) => r.tests || []),
     release_plan: {
-      preconditions: [...new Set(subReports.flatMap((r) => r.release_plan?.preconditions || []))],
-      monitoring: [...new Set(subReports.flatMap((r) => r.release_plan?.monitoring || []))],
-      rollback: [...new Set(subReports.flatMap((r) => r.release_plan?.rollback || []))],
+      preconditions: [...new Set(present.flatMap((r) => r.release_plan?.preconditions || []))],
+      monitoring: [...new Set(present.flatMap((r) => r.release_plan?.monitoring || []))],
+      rollback: [...new Set(present.flatMap((r) => r.release_plan?.rollback || []))],
     },
     verification: {
       traces: subReports.flatMap((r, i) =>
-        (r.verification?.traces || []).map((t) => ({ ...t, id: t.id ? `B${i + 1}-${t.id}` : t.id }))),
-      unverified_upgrades: subReports.flatMap((r) => r.verification?.unverified_upgrades || []),
-      degraded_steps: subReports.flatMap((r) => r.verification?.degraded_steps || []),
+        (!r ? [] : (r.verification?.traces || [])).map((t) => ({ ...t, id: t.id ? `B${i + 1}-${t.id}` : t.id }))),
+      unverified_upgrades: present.flatMap((r) => r.verification?.unverified_upgrades || []),
+      degraded_steps: [
+        ...present.flatMap((r) => r.verification?.degraded_steps || []),
+        ...failedNotes,
+      ],
     },
-    checked_paths: [...new Set(subReports.flatMap((r) => r.checked_paths || []))],
+    checked_paths: [...new Set(present.flatMap((r) => r.checked_paths || []))],
     metrics: {
-      perspectives_covered: [...new Set(subReports.flatMap((r) => r.metrics?.perspectives_covered || []))],
-      perspectives_skipped: [...new Set(subReports.flatMap((r) => r.metrics?.perspectives_skipped || []))],
+      perspectives_covered: [...new Set(present.flatMap((r) => r.metrics?.perspectives_covered || []))],
+      perspectives_skipped: [...new Set(present.flatMap((r) => r.metrics?.perspectives_skipped || []))],
       new_findings: deduped.length,
-      prev_fixed: subReports.reduce((s, r) => s + (r.metrics?.prev_fixed || 0), 0),
-      prev_still: subReports.reduce((s, r) => s + (r.metrics?.prev_still || 0), 0),
+      prev_fixed: present.reduce((s, r) => s + (r.metrics?.prev_fixed || 0), 0),
+      prev_still: present.reduce((s, r) => s + (r.metrics?.prev_still || 0), 0),
       bundles: meta.bundles?.length || subReports.length,
+      bundles_ok: present.length,
+      bundles_failed: (meta.bundleErrors || []).length,
     },
-    review_bundles: (meta.bundles || []).map((b, i) => ({ ...b, submitted: subReports[i]?._submitted === true })),
+    review_bundles: (meta.bundles || []).map((b, i) => ({
+      ...b,
+      submitted: subReports[i]?._submitted === true,
+      failed: !subReports[i],
+      error: (meta.bundleErrors || []).find((e) => e.idx === i + 1)?.error || null,
+    })),
   };
   merged.author_summary = buildAuthorSummary(merged);
   return merged;

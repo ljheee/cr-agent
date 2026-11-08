@@ -16,6 +16,7 @@
 import { Type } from "typebox";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { coerceStringifiedJsonFields } from "./report-schema.js";
 
 /** submit_review 的参数 schema（strict 兼容子集：无 anyOf 嵌套对象、required=全部键） */
 export function buildSubmitReviewSchema() {
@@ -90,8 +91,25 @@ export function buildSubmitReviewSchema() {
     })),
     checked_paths: Type.Optional(Type.Array(Type.String())),
     perspectives_covered: Type.Optional(Type.Array(Type.String())),
-    perspectives_skipped: Type.Optional(Type.Array(Type.String())),
+    // 元素放宽为 Any：提示词曾误导为 {id,reason} 对象；execute 内统一压成字符串，避免工具校验拒收后模型改吐中文
+    perspectives_skipped: Type.Optional(Type.Array(Type.Any())),
   });
+}
+
+/** perspectives_skipped 统一为字符串（兼容 "id" / "id: reason" / {id,reason}） */
+export function normalizePerspectivesSkipped(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map((x) => {
+    if (typeof x === "string") return x;
+    if (x && typeof x === "object") {
+      const id = x.id ?? x.perspective ?? "";
+      const reason = x.reason ?? "";
+      if (id && reason) return `${id}: ${reason}`;
+      if (id) return String(id);
+      if (reason) return String(reason);
+    }
+    return x == null ? "" : String(x);
+  }).filter((s) => s.length > 0);
 }
 
 /**
@@ -129,6 +147,12 @@ export function createSubmitReviewTool({ workDir, onSubmitted, bundleIdx }) {
     // 源头约束：端点支持 strict 时参数在解码层受语法约束；不支持自动降级（prefer）
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     async execute(toolCallId, params) {
+      // 部分模型把嵌套对象二次 stringify（review/tests 等成字符串）——先解一层再落盘/回调
+      if (params && typeof params === "object") params = coerceStringifiedJsonFields(params);
+      // perspectives_skipped 统一为字符串，保证下游 metrics 与 merge 的 Set 语义稳定
+      if (params && Array.isArray(params.perspectives_skipped)) {
+        params = { ...params, perspectives_skipped: normalizePerspectivesSkipped(params.perspectives_skipped) };
+      }
       const file = await persistBundleReport(workDir, bundleIdx, params);
       if (onSubmitted) {
         try { onSubmitted(params); } catch { /* 回调失败不影响工具成功 */ }

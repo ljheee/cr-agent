@@ -200,6 +200,7 @@ export async function runCrTurn(opts) {
   let usage = null;
   let eventTexts = [];   // 最近一轮 assistant 的 text parts（新 prompt 开始时清空）
   let earlyStopped = false;  // 文本通道流式早停：首个 { 平衡闭合即标记，尾部不入报告
+  let lastAssistantSnapshot = null; // 空响应排障：保留最近一轮 assistant 的 parts 摘要（dispose 前）
   const addUsage = (u) => {
     if (!u || typeof u !== "object") return;
     if (!usage) usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, turns: 0 };
@@ -241,6 +242,7 @@ export async function runCrTurn(opts) {
         addUsage(event.message.usage);
         const texts = (event.message.content || []).filter((c) => c && c.type === "text").map((c) => c.text).filter(Boolean);
         if (texts.length) eventTexts = texts;   // 覆盖式：保留最新一轮 assistant 文本
+        lastAssistantSnapshot = snapshotAssistantMessage(event.message);
       }
       if (onEvent) onEvent(event);
     } catch { /* 事件解析失败不阻塞 */ }
@@ -278,7 +280,14 @@ export async function runCrTurn(opts) {
         }
       }
     }
-    out = { text: finalText, usage, toolCalls, submittedReport, earlyStopped };
+    // dispose 前若事件流无 text，再从 session 抓一次快照（可能有 thinking-only）
+    if (!lastAssistantSnapshot) {
+      const msgs = session.state?.messages || [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i]?.role === "assistant") { lastAssistantSnapshot = snapshotAssistantMessage(msgs[i]); break; }
+      }
+    }
+    out = { text: finalText, usage, toolCalls, submittedReport, earlyStopped, lastAssistant: lastAssistantSnapshot };
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
     try { unsubscribe(); } catch { /* ignore */ }
@@ -288,8 +297,42 @@ export async function runCrTurn(opts) {
     try { session.dispose(); } catch { /* ignore */ }
   }
 
-  if (!out.text && !(wantSubmitTool && out.submittedReport)) throw new PiRunnerError("模型未返回任何文本且未调用 submit_review（检查端点/密钥/模型是否可用；若此前有 parse-fail，可能为重试轮会话异常，可重试整个审查）");
+  if (!out || (!out.text && !(wantSubmitTool && out?.submittedReport))) {
+    const err = new PiRunnerError("模型未返回任何文本且未调用 submit_review（检查端点/密钥/模型是否可用；若此前有 parse-fail，可能为重试轮会话异常，可重试整个审查）");
+    err.diagnostics = {
+      toolCalls,
+      usage,
+      earlyStopped,
+      submittedReport: !!(out && out.submittedReport),
+      lastAssistant: out?.lastAssistant || lastAssistantSnapshot,
+    };
+    throw err;
+  }
   return out;
+}
+
+/** 排障用：摘要 assistant message 的 content parts（截断正文，避免 progress 膨胀） */
+export function snapshotAssistantMessage(message, head = 800) {
+  if (!message || typeof message !== "object") return null;
+  const parts = Array.isArray(message.content) ? message.content : [];
+  return {
+    stopReason: message.stopReason || message.stop_reason || null,
+    parts: parts.map((p) => {
+      if (!p || typeof p !== "object") return { type: typeof p };
+      const row = { type: p.type || "unknown" };
+      if (typeof p.text === "string") {
+        row.textLen = p.text.length;
+        row.textHead = p.text.slice(0, head);
+      }
+      if (typeof p.thinking === "string") {
+        row.thinkingLen = p.thinking.length;
+        row.thinkingHead = p.thinking.slice(0, Math.min(head, 400));
+      }
+      if (p.name || p.toolName) row.toolName = p.name || p.toolName;
+      if (p.id || p.toolCallId) row.toolCallId = p.id || p.toolCallId;
+      return row;
+    }),
+  };
 }
 
 /** 文本截到首个括号平衡闭合点（字符串感知；无闭合点返回原文）——流式早停的截断工具 */

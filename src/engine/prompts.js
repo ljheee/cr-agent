@@ -77,7 +77,7 @@ const REPORT_JSON_INSTRUCTION = `
   },
   "checked_paths": ["已检查的文件/路径清单（结论为通过或无发现的文件必须列出；空清单+无发现视为未检查）"],
   "perspectives_covered": ["实际审查了的视角 id"],
-  "perspectives_skipped": [{"id": "", "reason": "为什么跳过"}]
+  "perspectives_skipped": ["视角id: 跳过原因（必须是字符串数组，不要用 {id,reason} 对象）"]
 }
 `;
 
@@ -108,7 +108,7 @@ export function buildSystemPrompt() {
 你拥有 read/grep/find 等只读工具：必须用它们阅读 diff 涉及的完整文件上下文（工作区有 PR.diff）、检索调用方、核实依赖，而不是只看 diff 片段。
 工作区 repo/ 目录是 PR head 的完整源码树（git checkout）：diff 未涉及的同文件未改动行、下游消费方都可直接 read/grep 查证——发现引用了未在 diff 中出现的代码时，必须先读源码树确认其实际行为，禁止仅凭 diff 推测记为「证据缺口」。仅当 repo/ 目录不存在或目标文件确实缺失时才可声明证据缺口，并注明「无源码树」。
 
-== 审查视角清单（21 个，逐个过一遍，适用的深入审、不适用的在 perspectives_skipped 里说明原因） ==
+== 审查视角清单（21 个，逐个过一遍，适用的深入审、不适用的写入 perspectives_skipped 字符串数组，如 "frontend: 无前端变更"） ==
 ${renderPerspectivesForPrompt()}
 
 ${DISCIPLINE}

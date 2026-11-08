@@ -111,7 +111,7 @@ async function renderSubmit(){
     <input id="prUrl" placeholder="https://github.com/owner/repo/pull/123">
     <div class="row" style="margin-top:10px;align-items:flex-end">
       <div><label>模型（留空用默认）</label><select id="mSel"><option value="">默认</option></select></div>
-      <div><label>推理强度</label><select id="tSel"><option>high</option><option>medium</option><option>xhigh</option></select></div>
+      <div><label>推理强度</label><select id="tSel"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></div>
       <div style="flex:0"><label>选项</label><label style="display:flex;gap:6px;align-items:center;color:var(--fg);cursor:pointer"><input type="checkbox" id="forceFull" style="width:auto"> 强制全量重审</label></div>
     </div>
     <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
@@ -131,7 +131,7 @@ async function renderSubmit(){
       (s.models||[]).map(m=>`<option value="${esc(m.id)}">${esc(m.name||m.id)}</option>`).join('');
     if(!s.models?.length) $('#goHint').textContent='⚠ 设置页未配置模型';
     if(!s.hasApiKey) $('#goHint').textContent='⚠ 未配置 API Key，请先到设置页';
-  }catch(e){}
+  }catch(e){$('#goHint').textContent='⚠ 设置加载失败：'+e.message}
   $('#goBtn').onclick=()=>startReview();
 }
 
@@ -154,7 +154,10 @@ async function startReview(){
       try{
         const p=await api(`/api/review/${reviewId}/progress`);
         pollFails=0;
-        prog.innerHTML=p.events.map(e=>{
+        // 只渲染最近 500 条，避免 events 达数万时每 1.5s 全量重建 innerHTML 卡死主线程
+        const evAll=p.events||[];
+        const evs=evAll.length>500?evAll.slice(-500):evAll;
+        prog.innerHTML=(evAll.length>500?`<div class="small mut">（仅显示最近 500 / ${evAll.length} 条事件）</div>`:'')+evs.map(e=>{
           const st=e.status==='done'||e.status==='ok'?'stage-ok':'';
           const det=e.pr?` ${esc(e.pr.repo)}#${esc(e.pr.number)}`:e.mode?` mode=${esc(e.mode)}`:e.model?` ${esc(e.model)}`:e.error?` <span class="error">${esc(e.error)}</span>`:'';
           const label=e.stage==='agent-event'?(e.event&&e.event.type?e.event.type:'agent'):(e.status||'');
@@ -221,7 +224,7 @@ function renderReport(r){
       ${r._toolCalls?`<div class="pill"><b>${r._toolCalls}</b>工具调用</div>`:''}
       ${r.ledger_stats?.adoption_rate!=null?`<div class="pill"><b>采纳率 ${(r.ledger_stats.adoption_rate*100)|0}%</b></div>`:''}
       ${r.review?.review_bundles?.length||r.review_bundles?.length?`<div class="pill"><b>${(r.review_bundles||r.review.review_bundles).length}</b>分桶</div>`:''}
-      ${r.review?.needs_human_reason?`<div class="pill"><b>轮次上限</b>需人工</div>`:''}
+      ${/* needs_human_reason 只写在账本，不进报告；轮次上限由 429 错误路径提示 */''}
     </div>
     ${r.blockers?.length?`<p class="small"><b style="color:var(--bad)">阻塞项：</b>${r.blockers.map(esc).join(', ')}</p>`:''}
   </div>
@@ -295,13 +298,17 @@ async function renderReports(){
   }catch(e){$('#rlist').innerHTML=`<p class="error">${esc(e.message)}</p>`}
 }
 window.viewReport=async id=>{
-  const r=await api(`/api/reports/${id}`);
-  // 可分享直达链接：#report/<id>，他人打开自动定位到该报告
-  if(location.hash!=='#report/'+id) location.hash='#report/'+id;
-  let rp=document.getElementById('rp');
-  if(!rp){rp=document.createElement('div');rp.id='rp';app.appendChild(rp);}
-  rp.innerHTML=`${renderReport(r)}<button class="ghost" onclick="document.getElementById('rp').remove();location.hash=''">关闭</button>`;
-  window.scrollTo(0,document.body.scrollHeight);
+  try{
+    const r=await api(`/api/reports/${id}`);
+    // 可分享直达链接：#report/<id>，他人打开自动定位到该报告
+    if(location.hash!=='#report/'+id) location.hash='#report/'+id;
+    let rp=document.getElementById('rp');
+    if(!rp){rp=document.createElement('div');rp.id='rp';app.appendChild(rp);}
+    rp.innerHTML=`${renderReport(r)}<button class="ghost" onclick="document.getElementById('rp').remove();location.hash=''">关闭</button>`;
+    window.scrollTo(0,document.body.scrollHeight);
+  }catch(e){
+    alert(`报告不存在或已过期（${e.message}）`);
+  }
 };
 
 /* ───────── 问题账本 ───────── */
@@ -334,7 +341,7 @@ async function loadLedgerDetail(box){
       <div class="row small" style="align-items:center;margin:2px 0">
         <span class="tag ${esc(f.severity)}">${esc(f.severity)}</span>
         <span style="flex:2">${esc(f.persist_id)} ${esc(f.title)} <span class="mut">(${esc(f.status)}${f.file?` · ${esc(f.file)}:${esc(String(f.line??''))}`:''})</span></span>
-        ${f.status!=='fixed'&&f.status!=='not_applicable'?`<button class="ghost" data-exf="${esc(f.file||'')}" data-ext="${esc(f.title.slice(0,40))}" style="flex:0">豁免</button>`:''}
+        ${f.status!=='fixed'&&f.status!=='not_applicable'?`<button class="ghost" data-exf="${esc(f.file||'')}" data-ext="${esc(f.title||'')}" style="flex:0">豁免</button>`:''}
       </div>`).join('')||'<p class="mut">无问题记录</p>';
     const exs=(l.exempt||[]).map((e,i)=>`
       <div class="row small" style="align-items:center;margin:2px 0">
@@ -409,7 +416,7 @@ async function renderSettings(){
       <select id="sDefaultModel">${(s.models||[]).map(m=>`<option value="${esc(m.id)}" ${m.id===s.defaultModel?'selected':''}>${esc(m.name||m.id)}</option>`).join('')}</select>
     </div><div>
       <label>默认推理强度</label>
-      <select id="sThinking"><option ${s.defaultThinking==='high'?'selected':''}>high</option><option ${s.defaultThinking==='medium'?'selected':''}>medium</option><option ${s.defaultThinking==='xhigh'?'selected':''}>xhigh</option></select>
+      <select id="sThinking">${['off','minimal','low','medium','high','xhigh','max'].map(v=>`<option value="${v}" ${s.defaultThinking===v?'selected':''}>${v}</option>`).join('')}</select>
     </div></div>
     <div style="margin:14px 0;display:flex;gap:10px">
       <button class="primary" id="sSave">保存</button>
