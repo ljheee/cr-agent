@@ -1,0 +1,8 @@
+{
+  "name": "前端 async 竞态与金额精度（JS）",
+  "diff": "diff --git a/src/components/PayButton.vue b/src/components/PayButton.vue\n--- a/src/components/PayButton.vue\n+++ b/src/components/PayButton.vue\n@@ -20,6 +20,12 @@\n   methods: {\n     async pay() {\n-      const r = await this.$api.createOrder(this.amount);\n+      const r = await this.$api.createOrder(this.amount * 0.9); // 打 9 折\n+      this.result = r;\n+      const pay = await this.$api.getPrice();\n+      // 显示保留两位\n+      this.total = pay.price.toFixed(2) - 0;\n     },\n   },\n",
+  "golden": [
+    { "file": "src/components/PayButton.vue", "line": 22, "category": "fund-safety", "producer": "human" },
+    { "file": "src/components/PayButton.vue", "line": 24, "category": "logic", "producer": "human" }
+  ]
+}

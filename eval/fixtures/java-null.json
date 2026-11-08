@@ -1,0 +1,7 @@
+{
+  "name": "空指针解引用（Java）",
+  "diff": "diff --git a/src/OrderService.java b/src/OrderService.java\n--- a/src/OrderService.java\n+++ b/src/OrderService.java\n@@ -10,7 +10,10 @@\n     public long calc(Order order) {\n-        long amount = order.getAmount();\n+        // 金额计算：优惠后再叠加运费\n+        long amount = order.getDiscount() != null ? order.getAmount() - order.getDiscount().getValue() : order.getAmount();\n+        if (order.getCoupon() != null) {\n+            amount -= order.getCoupon().getValue();\n+        }\n         return amount + shippingFee;\n     }\n",
+  "golden": [
+    { "file": "src/OrderService.java", "line": 13, "category": "logic", "producer": "human" }
+  ]
+}
