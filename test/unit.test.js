@@ -1133,12 +1133,26 @@ test("pi-runner 源码级断言：submit_review 通道 + 早停截断存在（�
   assert.ok(src.includes("err.diagnostics"), "空响应挂 diagnostics");
   // 文本通道早停：message_update 增量平衡扫描
   assert.ok(src.includes('"message_update"') && src.includes("earlyStopped"), "早停扫描存在");
+  assert.ok(src.includes("inSessionFormatRetries") && src.includes("isDeliveryReady"), "同会话格式纠正");
   // workflow 消费双通道
   const wfSrc = await readFile(new URL("../src/engine/workflow.js", import.meta.url), "utf8");
   assert.ok(wfSrc.includes("submittedReport && typeof submittedReport === \"object\""), "workflow 优先工具通道");
-  assert.ok(wfSrc.includes('status: "parse-fail"') && wfSrc.includes("textHead"), "parse-fail 记录 textHead");
+  assert.ok(wfSrc.includes('"parse-fail"') && wfSrc.includes("textHead"), "parse-fail 记录 textHead");
   assert.ok(wfSrc.includes("empty-response") && wfSrc.includes("persistAgentRaw"), "空响应落盘 raw");
   assert.ok(wfSrc.includes("_submitted = true"), "工具通道标记 _submitted");
+  assert.ok(wfSrc.includes("MAX_COLD_START_FALLBACKS") && wfSrc.includes("cold-start"), "冷启动兜底一次");
+  assert.ok(wfSrc.includes("MAX_IN_SESSION_FORMAT_RETRIES"), "同会话纠正次数常量");
+});
+
+test("isDeliveryReady：submit_review / 合法 JSON / 散文 三分支", async () => {
+  const { isDeliveryReady } = await import("../src/engine/pi-runner.js");
+  assert.equal(isDeliveryReady({ submittedReport: { conclusion: "通过" }, text: "" }), true);
+  assert.equal(isDeliveryReady({
+    text: JSON.stringify({ conclusion: "通过", one_line: "ok", findings: [] }),
+  }), true);
+  assert.equal(isDeliveryReady({ text: "我先查看工作区结构，然后逐条核实。" }), false);
+  assert.equal(isDeliveryReady({ text: "\n" }), false);
+  assert.equal(isDeliveryReady(null), false);
 });
 
 /* ───────── v21：定级锚点量化（severity-anchors）───────── */

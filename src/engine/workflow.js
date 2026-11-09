@@ -13,7 +13,7 @@
 import { mkdir, writeFile, rm, rename, readdir } from "node:fs/promises";
 import path from "node:path";
 import { resolvePr, parsePrUrl } from "../pr-resolver.js";
-import { runCrTurn } from "./pi-runner.js";
+import { runCrTurn, FORMAT_RETRY_NUDGE } from "./pi-runner.js";
 import { normalizeReport, applyProgrammaticDemotion, coerceStringifiedJsonFields, coerceFindingLine } from "./report-schema.js";
 import { buildSystemPrompt, buildFastSystemPrompt, buildFullReviewUserPrompt, buildIncrementalUserPrompt } from "./prompts.js";
 import { Ledger } from "./ledger.js";
@@ -64,7 +64,10 @@ async function loadSeverityRules(dataDir) {
 
 const FAST_PATH_THRESHOLD_LINES = 200;   // 小 PR 快速通道阈值
 const BUNDLE_THRESHOLD_LINES = 400;      // 超过则分桶多轮审查（分治防大变更注意力稀释）
-const MAX_JSON_RETRIES = 2;
+/** 同会话内交卷失败后的格式纠正次数（追加 prompt，不丢工具轨迹） */
+const MAX_IN_SESSION_FORMAT_RETRIES = 2;
+/** 同会话仍失败后的冷启动兜底次数（全新 session；默认 1） */
+const MAX_COLD_START_FALLBACKS = 1;
 // 轮次上限（Anthropic 收敛四规则）：超限强制 needs_human；可在设置页调整（settings.maxRounds，默认 3）
 const DEFAULT_MAX_ROUNDS = 3;
 
@@ -299,117 +302,149 @@ export class CrWorkflow {
     const runOneTurn = async (ctx) => {
       const { systemPrompt, userPrompt, workDir: wd } = ctx;
       this.emit({ stage: "agent", status: "start", model: modelId, bundle: ctx.bundleIdx });
-      for (let attempt = 1; attempt <= MAX_JSON_RETRIES; attempt++) {
-        const extra = attempt > 1
-          ? `\n\n（注意：上一次输出不是合法 JSON。这次优先调用 submit_review 工具提交报告对象；若必须文本输出，只输出 JSON 本体，不要任何其他文字，也不要再调用工具。）`
-          : "";
-        // 只转发低频关键事件：message_update 是逐 token 高频流水（每分钟数千条），
-        // 打爆进度事件数组（MAX_EVENTS）导致进度接口"装死"被误判为断流
-        const noisy = new Set(["message_update"]);
+      // 只转发低频关键事件：message_update 是逐 token 高频流水（每分钟数千条），
+      // 打爆进度事件数组（MAX_EVENTS）导致进度接口"装死"被误判为断流
+      const noisy = new Set(["message_update"]);
+      const onAgentEvent = (e) => {
+        const type = e?.type;
+        if (noisy.has(type)) return;
+        this.emit({ stage: "agent-event", event: { type }, bundle: ctx.bundleIdx });
+      };
+      const emitDeliveryFail = async ({ kind, attempt, sessionKind, text, error, toolCalls, submitted, diagnostics }) => {
+        const rawName = await persistAgentRaw(wd, {
+          kind,
+          bundleIdx: ctx.bundleIdx,
+          attempt,
+          text: text || "",
+          error: error || null,
+          diagnostics: diagnostics || null,
+        });
+        this.emit({
+          stage: "agent",
+          status: kind === "empty-response" || kind === "agent-fail" ? kind : "parse-fail",
+          attempt,
+          session: sessionKind,
+          bundle: ctx.bundleIdx,
+          error: error || "",
+          textLen: (text || "").length,
+          textHead: redact((text || "").slice(0, RAW_TEXT_HEAD), secrets),
+          toolCalls,
+          submitted: !!submitted,
+          rawFile: rawName,
+          diagnostics: diagnostics || undefined,
+        });
+      };
+      /** 单次会话：同会话内最多 MAX_IN_SESSION_FORMAT_RETRIES 次 nudge；成功返回 report，失败返回 null */
+      let lastTextHead = "";
+      let lastError = "";
+      const runSession = async (prompt, sessionKind) => {
         let text = "";
         let usage = null;
         let toolCalls = 0;
         let submittedReport = null;
+        let inSessionNudges = 0;
         try {
-          ({ text, usage, toolCalls, submittedReport } = await runCrTurn({
+          ({ text, usage, toolCalls, submittedReport, inSessionNudges } = await runCrTurn({
             settings, dataDir: this.dataDir, workDir: wd, bundleIdx: ctx.bundleIdx,
-            systemPrompt, userPrompt: userPrompt + extra,
+            systemPrompt, userPrompt: prompt,
             model: modelId, thinkingLevel,
-            onEvent: (e) => {
-              const type = e?.type;
-              if (noisy.has(type)) return;
-              this.emit({ stage: "agent-event", event: { type }, bundle: ctx.bundleIdx });
+            inSessionFormatRetries: MAX_IN_SESSION_FORMAT_RETRIES,
+            formatNudge: FORMAT_RETRY_NUDGE,
+            onEvent: onAgentEvent,
+            onFormatRetry: async ({ attempt, text: failText }) => {
+              lastTextHead = (failText || "").slice(0, 120);
+              lastError = "同会话交卷失败，追加格式纠正提示";
+              await emitDeliveryFail({
+                kind: "parse-fail",
+                attempt,
+                sessionKind,
+                text: failText,
+                error: lastError,
+                toolCalls: null,
+                submitted: false,
+              });
             },
           }));
         } catch (e) {
-          // 空响应（带 diagnostics）或其它会话异常（超时等）：progress + audit 落盘可复查
           const diagnostics = e?.diagnostics || null;
           const status = diagnostics ? "empty-response" : "agent-fail";
           const headFromParts = (diagnostics?.lastAssistant?.parts || [])
             .map((p) => p.textHead || p.thinkingHead || "")
             .filter(Boolean)
             .join("\n");
-          const rawName = await persistAgentRaw(wd, {
+          lastTextHead = headFromParts.slice(0, 120);
+          lastError = e?.message || String(e);
+          await emitDeliveryFail({
             kind: status,
-            bundleIdx: ctx.bundleIdx,
-            attempt,
+            attempt: (diagnostics?.inSessionNudges || 0) + 1,
+            sessionKind,
             text: headFromParts,
-            error: e?.message || String(e),
+            error: lastError,
+            toolCalls: diagnostics?.toolCalls,
+            submitted: diagnostics?.submittedReport,
             diagnostics,
           });
-          this.emit({
-            stage: "agent",
-            status,
-            attempt,
-            bundle: ctx.bundleIdx,
-            error: e?.message || String(e),
-            textLen: headFromParts.length,
-            textHead: redact(headFromParts.slice(0, RAW_TEXT_HEAD), secrets),
-            diagnostics,
-            rawFile: rawName,
-          });
+          // 可交卷失败（空响应）允许外层冷启动；超时/模型缺失等硬错误直接抛
+          if (e?.deliveryFailed) return null;
           throw e;
         }
-        // 通道 1：submit_review 工具提交（对象直传，无字符串解析环节；strict 端点下参数解码层受语法约束）
+        // 通道 1：submit_review
         if (submittedReport && typeof submittedReport === "object") {
           try {
-            // 工具通道再解一层 stringify（与 submit_review execute / normalizeReport 同款），防旧会话/漏网字段
             const rep = normalizeReport(coerceStringifiedJsonFields(submittedReport));
             rep._usage = usage; rep._toolCalls = toolCalls; rep._submitted = true;
+            rep._inSessionNudges = inSessionNudges || 0;
+            rep._sessionKind = sessionKind;
             return rep;
           } catch (e) {
-            // 工具参数也应校验失败兜底（strict 不支持端点模型可能塞非法枚举）：走文本通道重试
             const dumped = (() => { try { return JSON.stringify(submittedReport); } catch { return String(submittedReport); } })();
-            const rawName = await persistAgentRaw(wd, {
+            lastTextHead = dumped.slice(0, 120);
+            lastError = `submit_review 参数校验失败：${e.message}`;
+            await emitDeliveryFail({
               kind: "submit-normalize-fail",
-              bundleIdx: ctx.bundleIdx,
-              attempt,
+              attempt: (inSessionNudges || 0) + 1,
+              sessionKind,
               text: dumped,
-              error: e.message,
-            });
-            this.emit({
-              stage: "agent",
-              status: "parse-fail",
-              attempt,
-              bundle: ctx.bundleIdx,
-              error: `submit_review 参数校验失败：${e.message}`,
-              textLen: dumped.length,
-              textHead: redact(dumped.slice(0, RAW_TEXT_HEAD), secrets),
-              rawFile: rawName,
+              error: lastError,
+              toolCalls,
+              submitted: true,
             });
           }
         }
+        // 通道 2：文本 JSON
         try {
           const rep = normalizeReport(text);
           rep._usage = usage; rep._toolCalls = toolCalls;
-          // 文本通道同样落盘分文件（与 submit_review 工具共用一个落盘函数）：
-          // 模型不调工具时分文件隔离与 audit 归档仍生效；失败不阻塞报告交付
+          rep._inSessionNudges = inSessionNudges || 0;
+          rep._sessionKind = sessionKind;
           try { await persistBundleReport(wd, ctx.bundleIdx, rep); rep._file_persisted = "text-channel"; }
           catch (e) { this.emit({ stage: "agent", status: "persist-fail", bundle: ctx.bundleIdx, error: String(e.message || e) }); }
           return rep;
         } catch (e) {
-          const rawName = await persistAgentRaw(wd, {
+          lastTextHead = (text || "").slice(0, 120);
+          lastError = e.message;
+          await emitDeliveryFail({
             kind: "parse-fail",
-            bundleIdx: ctx.bundleIdx,
-            attempt,
+            attempt: (inSessionNudges || 0) + 1,
+            sessionKind,
             text: text || "",
             error: e.message,
-          });
-          this.emit({
-            stage: "agent",
-            status: "parse-fail",
-            attempt,
-            bundle: ctx.bundleIdx,
-            error: e.message,
-            textLen: (text || "").length,
-            textHead: redact((text || "").slice(0, RAW_TEXT_HEAD), secrets),
             toolCalls,
             submitted: !!submittedReport,
-            rawFile: rawName,
           });
-          if (attempt >= MAX_JSON_RETRIES) throw new Error(`模型输出无法解析为 JSON 报告（末次输出开头：${(text || "").slice(0, 120)}）：${e.message}`);
+          return null;
         }
+      };
+
+      // 主会话（同会话 nudge）→ 仍失败则冷启动兜底 1 次
+      const primary = await runSession(userPrompt, "primary");
+      if (primary) return primary;
+      for (let cold = 1; cold <= MAX_COLD_START_FALLBACKS; cold++) {
+        this.emit({ stage: "agent", status: "cold-start", attempt: cold, bundle: ctx.bundleIdx });
+        const fallback = await runSession(`${userPrompt}\n\n${FORMAT_RETRY_NUDGE}`, `cold-start-${cold}`);
+        if (fallback) return fallback;
       }
+      throw new Error(`模型输出无法解析为 JSON 报告（同会话纠正 ${MAX_IN_SESSION_FORMAT_RETRIES} 次 + 冷启动 ${MAX_COLD_START_FALLBACKS} 次均失败；末次输出开头：${lastTextHead}）${lastError ? `：${lastError}` : ""}`);
     };
 
     let report;

@@ -22,8 +22,26 @@ import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager } 
 // 纯函数部分拆到 pi-models.js（零 SDK 依赖）：测试/CI 可离线导入，不必安装 pi SDK 树
 import { PiRunnerError, buildModelsJson } from "./pi-models.js";
 import { createSubmitReviewTool } from "./submit-review-tool.js";
+import { normalizeReport } from "./report-schema.js";
 
 export { PiRunnerError, buildModelsJson };
+
+/** 同会话交卷纠正提示（未调 submit_review / 非 JSON 时追加一轮 prompt） */
+export const FORMAT_RETRY_NUDGE =
+  "（注意：上一次输出不是合法审查报告。请立即调用 submit_review 工具提交完整报告对象；若必须文本输出，只输出 JSON 本体，不要任何其他文字，也不要再调用其它工具。）";
+
+/**
+ * 本轮是否已具备可交付产物：submit_review 对象，或文本可 normalize 为报告。
+ * 供同会话 nudge 循环与单测使用。
+ */
+export function isDeliveryReady(out, { wantSubmitTool = true } = {}) {
+  if (!out || typeof out !== "object") return false;
+  if (wantSubmitTool && out.submittedReport && typeof out.submittedReport === "object") return true;
+  const text = typeof out.text === "string" ? out.text.trim() : "";
+  if (!text) return false;
+  try { normalizeReport(text); return true; }
+  catch { return false; }
+}
 
 /**
  * 只读审查允许的工具（白名单，其余一律不给）。
@@ -137,10 +155,17 @@ function installMaxTokensHook() {
  * 运行一轮 CR 会话。
  * @param {object} opts
  *   { settings, dataDir, workDir, systemPrompt, userPrompt, model, thinkingLevel, onEvent }
- * @returns {{ text: string, usage: object|null, toolCalls: number, submittedReport: object|null, earlyStopped: boolean }}
+ * @returns {{ text: string, usage: object|null, toolCalls: number, submittedReport: object|null, earlyStopped: boolean, inSessionNudges: number }}
  */
 export async function runCrTurn(opts) {
-  const { settings, dataDir, workDir, systemPrompt, userPrompt, model: modelId, thinkingLevel = "high", onEvent, timeoutMs = 90 * 60 * 1000, agentDirSub = "", tools: allowedTools = SESSION_TOOLS } = opts;
+  const {
+    settings, dataDir, workDir, systemPrompt, userPrompt, model: modelId, thinkingLevel = "high",
+    onEvent, timeoutMs = 90 * 60 * 1000, agentDirSub = "", tools: allowedTools = SESSION_TOOLS,
+    // 同会话格式纠正次数（首次 prompt 之外追加 nudge 的上限）；0=不纠正
+    inSessionFormatRetries = 2,
+    formatNudge = FORMAT_RETRY_NUDGE,
+    onFormatRetry = null, // ({ attempt, text, reason }) => void
+  } = opts;
   installMaxTokensHook();
 
   const agentDir = await preparePiDir(settings, dataDir, agentDirSub);
@@ -250,24 +275,12 @@ export async function runCrTurn(opts) {
     } catch { /* 事件解析失败不阻塞 */ }
   });
 
-  // 5) 执行（带整体超时，防 agent 会话挂死占住资源）+ 提取最终 assistant 文本
+  // 5) 执行：同会话内可多次 prompt（交卷失败则 nudge），整体超时覆盖整段会话
   let timeoutHandle = null;
   let out = null;
-  try {
-    const turn = (async () => {
-      await session.prompt(userPrompt);
-      await session.waitForIdle();
-    })();
-    // 预挂 catch：超时后 turn 仍在运行，若后续 reject（dispose 触发）无观察者会 crash 进程
-    turn.catch(() => {});
-    eventTexts = [];   // 新一轮 prompt：清空上一轮的累积文本
-    const timer = new Promise((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(new PiRunnerError(`审查会话超时（${Math.round(timeoutMs / 60000)} 分钟）`)), timeoutMs);
-      timeoutHandle.unref?.();
-    });
-    await Promise.race([turn, timer]);
-    // 优先用事件流累积的文本（会话状态异常时仍可靠）；退回读 session.state.messages
-    // 早停标记时截到闭合点：尾部解释文字已生成但不进报告（与 normalizeReport 平衡扫描一致）
+  let inSessionNudges = 0;
+  const extractOut = () => {
+    // 优先用事件流累积的文本；早停时截到闭合点；退回读 session.state.messages
     let finalText = "";
     if (eventTexts.length) {
       finalText = eventTexts.join("\n");
@@ -282,14 +295,58 @@ export async function runCrTurn(opts) {
         }
       }
     }
-    // dispose 前若事件流无 text，再从 session 抓一次快照（可能有 thinking-only）
     if (!lastAssistantSnapshot) {
       const msgs = session.state?.messages || [];
       for (let i = msgs.length - 1; i >= 0; i--) {
         if (msgs[i]?.role === "assistant") { lastAssistantSnapshot = snapshotAssistantMessage(msgs[i]); break; }
       }
     }
-    out = { text: finalText, usage, toolCalls, submittedReport, earlyStopped, lastAssistant: lastAssistantSnapshot };
+    return {
+      text: finalText,
+      usage,
+      toolCalls,
+      submittedReport,
+      earlyStopped,
+      lastAssistant: lastAssistantSnapshot,
+      inSessionNudges,
+    };
+  };
+  const promptOnce = async (promptText) => {
+    // 必须在 prompt 前清空本轮文本，避免与异步 message_update 竞态丢/串文本
+    eventTexts = [];
+    earlyStopped = false;
+    lastAssistantSnapshot = null;
+    const turn = (async () => {
+      await session.prompt(promptText);
+      await session.waitForIdle();
+    })();
+    turn.catch(() => {});
+    await turn;
+    return extractOut();
+  };
+  try {
+    const timer = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => reject(new PiRunnerError(`审查会话超时（${Math.round(timeoutMs / 60000)} 分钟）`)), timeoutMs);
+      timeoutHandle.unref?.();
+    });
+    const work = (async () => {
+      out = await promptOnce(userPrompt);
+      // 同会话纠正：未交卷且文本也不是报告 → 追加 nudge（保留工具轨迹，避免冷启动重读）
+      const maxNudges = wantSubmitTool ? Math.max(0, Number(inSessionFormatRetries) || 0) : 0;
+      while (out && !isDeliveryReady(out, { wantSubmitTool }) && inSessionNudges < maxNudges) {
+        inSessionNudges++;
+        try {
+          await onFormatRetry?.({
+            attempt: inSessionNudges,
+            text: out.text || "",
+            reason: "in-session-format-retry",
+          });
+        } catch { /* 回调失败不阻断纠正 */ }
+        out = await promptOnce(formatNudge);
+        out.inSessionNudges = inSessionNudges;
+      }
+    })();
+    await Promise.race([work, timer]);
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
     try { unsubscribe(); } catch { /* ignore */ }
@@ -307,9 +364,12 @@ export async function runCrTurn(opts) {
       earlyStopped,
       submittedReport: !!(out && out.submittedReport),
       lastAssistant: out?.lastAssistant || lastAssistantSnapshot,
+      inSessionNudges,
     };
+    err.deliveryFailed = true; // 允许 workflow 再冷启动一次
     throw err;
   }
+  out.inSessionNudges = inSessionNudges;
   return out;
 }
 
