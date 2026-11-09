@@ -569,6 +569,15 @@ test("ledger: needs_human 不被 still_exists 降级 + trace 查证成功关闭"
     review: { previous_findings: [{ id: "trace:T1", status: "still_exists" }] },
     decision_changes: [{ trace_id: "T1", decision: "d", status: "unverified", file: "a.js" }] });
   assert.equal(L.data.findings.find((f) => f.persist_id === "trace:T1").status, "needs_human");
+  // 第 4 轮：decision_changes 再报 needs_human 不得误关为 fixed
+  L.applyRound({ conclusion: "不通过", findings: [],
+    decision_changes: [{ trace_id: "T1", decision: "d", status: "needs_human", file: "a.js" }] });
+  assert.equal(L.data.findings.find((f) => f.persist_id === "trace:T1").status, "needs_human");
+  // 首轮单独 needs_human 应建 trace 并标 needs_human（不是静默丢弃）
+  const L0 = await Ledger.load(dir, "r0", 1);
+  L0.applyRound({ conclusion: "不通过", findings: [],
+    decision_changes: [{ trace_id: "T9", decision: "人工确认边界", status: "needs_human", file: "x.js" }] });
+  assert.equal(L0.data.findings.find((f) => f.persist_id === "trace:T9")?.status, "needs_human");
   // 新 PR：查证成功关闭 trace 条目
   const L2 = await Ledger.load(dir, "r2", 1);
   L2.applyRound({ conclusion: "通过", findings: [],
@@ -576,6 +585,18 @@ test("ledger: needs_human 不被 still_exists 降级 + trace 查证成功关闭"
   L2.applyRound({ conclusion: "通过", findings: [],
     decision_changes: [{ trace_id: "T1", decision: "d", status: "consistent", file: "a.js" }] });
   assert.equal(L2.data.findings.find((f) => f.persist_id === "trace:T1").status, "fixed");
+  await rm(dir, { recursive: true, force: true });
+});
+
+test("ledger: 文件名与锁 key 同源小写归一", async () => {
+  const { ledgerSlug } = await import("../src/engine/ledger.js");
+  assert.equal(ledgerSlug("Owner/Repo", 1), "owner_repo#1");
+  assert.equal(ledgerSlug("owner/repo/", 1), "owner_repo#1");
+  const dir = await mkdtemp("/tmp/cr-ledger-case-");
+  const a = await Ledger.load(dir, "Owner/Repo", 7);
+  await a.save();
+  const b = await Ledger.load(dir, "owner/repo", 7);
+  assert.equal(a.file, b.file);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -1048,6 +1069,8 @@ test("repairJson：缺逗号/尾逗号/单引号/干净截断修复；字符串�
   assert.equal(JSON.parse(repairJson('{"a":[1,2,],}')).a.length, 2);
   // 单引号
   assert.equal(JSON.parse(repairJson(`{"a":'x'}`)).a, "x");
+  // 单引号串内裸控制字符按 s[j] 转义（勿误用外层 c）
+  assert.equal(JSON.parse(repairJson("{'a':'x\ty'}")).a, "x\ty");
   // 干净截断（value 边界）
   assert.equal(JSON.parse(repairJson('{"a":1')).a, 1);
   // 字符串内截断：保守返回原文（上层报错走模型重试）
@@ -1055,6 +1078,15 @@ test("repairJson：缺逗号/尾逗号/单引号/干净截断修复；字符串�
   // 正常 JSON 不被误伤
   const normal = '{"a":"x y","b":[{"c":1}],"d":null,"e":true}';
   assert.equal(JSON.parse(repairJson(normal)).a, "x y");
+});
+
+test("pi-runner: 非 SSE chat/completions 路径也清理 lifetime 定时器", async () => {
+  const src = await import("node:fs/promises").then((fs) =>
+    fs.readFile(new URL("../src/engine/pi-runner.js", import.meta.url), "utf8"));
+  // 非流式/无 body 分支必须 clearTimeout(lifetime)，避免 30min 空挂
+  assert.ok(/clearTimeout\(lifetime\)/.test(src));
+  const afterStream = src.split("return new Response(res.body.pipeThrough(ts), res)")[1] || "";
+  assert.ok(afterStream.includes("clearTimeout(lifetime)"), "流式分支之后的 return res 前应 disarm lifetime");
 });
 
 test("normalizeReport：嵌套字段被二次 stringify 时自动解一层", async () => {

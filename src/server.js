@@ -284,6 +284,7 @@ app.get("/api/perspectives", (req, res) => {
 // 大小写不敏感文件系统（APFS/默认 Windows）下两个不同大小写的账本文件名实为同一文件，
 // 并发读-改-写会丢失更新，统一小写归一）
 function normalizeLockKey(repo, pr) {
+  // 与 Ledger.ledgerSlug 同源小写归一（锁与账本文件必须指向同一 PR）
   return `${String(repo || "").trim().replace(/\/+$/, "").toLowerCase()}#${Number(pr)}`;
 }
 

@@ -180,7 +180,7 @@ export class CrWorkflow {
       this.emit({ stage: "mode", status: "done", mode: "full", round: capLedger.round + 1, roundsCapped: true });
       capLedger.data.needs_human_reason = `已达轮次上限 ${maxRounds}，剩余未闭环问题请人工确认`;
       await capLedger.save();
-      const err = new Error(`该 PR 已审查 ${capLedger.round} 轮（上限 ${maxRounds}），请人工确认剩余问题后再触发新审查；如确需重置可删除账本文件 data/ledgers/${parsed.repo.replace(/\//g, "_")}#${parsed.pr}.json`);
+      const err = new Error(`该 PR 已审查 ${capLedger.round} 轮（上限 ${maxRounds}），请人工确认剩余问题后再触发新审查；如确需重置可删除账本文件 data/ledgers/${String(parsed.repo || "").trim().replace(/\/+$/, "").replace(/\//g, "_").toLowerCase()}#${Number(parsed.pr)}.json`);
       err.status = 429;
       throw err;
     }

@@ -207,9 +207,14 @@ export function repairJson(s) {
       for (; j < s.length; j++) {
         if (s[j] === "\\") { s2 += s[j] + (s[j + 1] || ""); j++; continue; }
         if (s[j] === "'") break;
+        const ch = s[j];
         const code = s.charCodeAt(j);
-        if (code < 0x20) { s2 += c === "\n" ? "\\n" : "\\u" + code.toString(16).padStart(4, "0"); continue; }
-        s2 += s[j];
+        // 必须用 ch（=s[j]），勿用外层循环的 c（那是开头的单引号）
+        if (code < 0x20) {
+          s2 += ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : "\\u" + code.toString(16).padStart(4, "0");
+          continue;
+        }
+        s2 += ch;
       }
       if (j < s.length) {  // 找到配对：整段替换为双引号字符串
         out += '"' + s2 + '"';

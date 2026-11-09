@@ -8,10 +8,15 @@
  *    2. 存量 P3 不入账（风格类噪声治理）
  *    3. unverified 查证失败连续 2 轮 → 自动升级 needs_human，不再每轮重试
  *
- * 存储：data/ledgers/{repoSlug}#{pr}.json
+ * 存储：data/ledgers/{repoSlug}#{pr}.json（slug 小写归一，与 withPrLock 同源）
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+
+/** 账本文件 slug：trim、去尾斜杠、/→_、小写——与 server normalizeLockKey 对齐，防大小写分叉 */
+export function ledgerSlug(repo, pr) {
+  return `${String(repo || "").trim().replace(/\/+$/, "").replace(/[\/]/g, "_").toLowerCase()}#${Number(pr)}`;
+}
 
 export class Ledger {
   constructor(file) {
@@ -26,7 +31,7 @@ export class Ledger {
   }
 
   static async load(dataDir, repo, pr) {
-    const slug = `${repo.replace(/[\/]/g, "_")}#${pr}`;
+    const slug = ledgerSlug(repo, pr);
     const dir = path.join(dataDir, "ledgers");
     await mkdir(dir, { recursive: true });
     const l = new Ledger(path.join(dir, `${slug}.json`));
@@ -111,16 +116,15 @@ export class Ledger {
       else if (pf.status === "still_exists") target.status = "still_exists";
     }
 
-    // unverified 升级：decision_changes 里 unverified 的 trace，连续 2 轮 → needs_human；
-    // 已验证（consistent/conflicting）的 trace 同名条目关闭，不再滞留 stats。
-    // 键稳定性：分桶轮的 trace_id 带 B{idx}- 桶前缀（展示用，防撞），后续不分桶轮模型用裸 T1 ——
-    // 匹配时先按全键找，找不到则去前缀后按裸 id 找（B1-T1 与 T1 归并为同一逻辑查证点）
+    // decision_changes trace 状态机：
+    //  - unverified：累计，连续 2 轮 → needs_human
+    //  - needs_human：升级/保持人工态（绝不当「查证成功」关闭）
+    //  - consistent/conflicting：已验证 → 关闭对应 trace
+    // 键稳定性：分桶轮 trace_id 带 B{idx}- 前缀；匹配时全键优先，再按裸 id 归并
     for (const dc of report.decision_changes || []) {
-      // status 白名单：模型输出垃圾值会被当作"查证成功"误关 trace 条目
+      // status 白名单：垃圾值跳过，避免误关/误建
       const DC_STATUS = ["consistent", "conflicting", "unverified", "needs_human"];
       if (!DC_STATUS.includes(dc.status)) continue;
-      // 键稳定性：分桶轮的 trace_id 带 B{idx}- 前缀（展示防撞），后续轮可能用裸 id（或反之）。
-      // 先按全键找；找不到则按"去前缀后的裸 id"找既有条目（B1-T1 与 T1 归并为同一逻辑查证点）
       let entry = this.data.findings.find((f) => f.persist_id === `trace:${dc.trace_id}`);
       if (!entry) {
         const bare = String(dc.trace_id || "").replace(/^B\d+-/, "");
@@ -129,19 +133,35 @@ export class Ledger {
             (f.persist_id === `trace:${bare}` ||
              String(f.persist_id || "").replace(/^trace:B\d+-/, "trace:") === `trace:${bare}`));
           if (entry) {
-            // 归并：把本轮键记为别名（防每轮新键漂移出孤儿条目）
             entry.trace_aliases = [...new Set([...(entry.trace_aliases || []), `trace:${dc.trace_id}`])];
           }
         }
       }
-      if (dc.status !== "unverified") {
-        // 查证成功 → 关闭对应 trace 条目（含去前缀归并后的，若无则不建）
+      if (dc.status === "consistent" || dc.status === "conflicting") {
         if (entry && entry.status !== "fixed") {
           entry.status = "fixed";
           entry.history.push({ round: roundNo, note: `查证成功关闭: ${dc.status}` });
         }
         continue;
       }
+      if (dc.status === "needs_human") {
+        if (!entry) {
+          this.data.findings.push({
+            persist_id: `trace:${dc.trace_id}`, round_id: dc.trace_id,
+            title: `查证失败: ${dc.decision || ""}`.slice(0, 120),
+            severity: "P2", category: "verification", file: dc.file, line: dc.line,
+            suggestion: "请人工确认该判定点（Agent 已升级 needs_human）", status: "needs_human",
+            unverified_rounds: 2, first_seen_round: roundNo, last_seen_round: roundNo,
+            history: [{ round: roundNo, note: `needs_human: ${dc.decision || ""}` }],
+          });
+        } else if (entry.status !== "fixed" && entry.status !== "not_applicable") {
+          entry.status = "needs_human";
+          entry.last_seen_round = roundNo;
+          entry.history.push({ round: roundNo, note: `needs_human: ${dc.decision || ""}` });
+        }
+        continue;
+      }
+      // unverified
       if (!entry) {
         this.data.findings.push({
           persist_id: `trace:${dc.trace_id}`, round_id: dc.trace_id, title: `查证失败: ${dc.decision || ""}`.slice(0, 120),
@@ -152,6 +172,7 @@ export class Ledger {
         });
       } else {
         entry.unverified_rounds = (entry.unverified_rounds || 0) + 1;
+        entry.last_seen_round = roundNo;
         if (entry.unverified_rounds >= 2) entry.status = "needs_human";
       }
     }

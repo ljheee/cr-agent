@@ -127,6 +127,8 @@ function installMaxTokensHook() {
       });
       return new Response(res.body.pipeThrough(ts), res);
     }
+    // 非 SSE / 无 body：流不会消费，必须立刻 disarm，否则 30min 后空挂 abort
+    clearTimeout(lifetime);
     return res;
   };
 }
