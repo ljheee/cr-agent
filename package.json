@@ -1,0 +1,21 @@
+{
+  "name": "cr-agent",
+  "version": "1.0.0",
+  "description": "Generic AI Code Review agent built on pi-coding-agent",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/unit.test.js",
+    "eval": "node eval/run-eval.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "express": "^4.21.0"
+  },
+  "overrides": {
+    "@aws-sdk/credential-provider-login": "3.972.86",
+    "@aws-sdk/nested-clients": "3.997.53"
+  }
+}

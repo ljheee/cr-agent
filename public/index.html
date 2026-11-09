@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CR-Agent · AI Code Review</title>
+<style>
+:root{--bg:#0f1117;--panel:#171a23;--panel2:#1e2230;--line:#2a2f42;--fg:#e8eaf2;--mut:#8b93a8;--acc:#5b8cff;--ok:#3ecf8e;--warn:#ffb86b;--bad:#ff6b81;--p0:#ff4d6d;--p1:#ff9840;--p2:#ffd166;--p3:#8b93a8;}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:14px;padding:12px 22px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:9}
+header h1{font-size:16px;margin:0}
+header nav{display:flex;gap:6px;margin-left:auto}
+header nav button{background:none;border:1px solid var(--line);color:var(--mut);padding:5px 14px;border-radius:8px;cursor:pointer}
+header nav button.active{color:var(--fg);border-color:var(--acc);background:rgba(91,140,255,.12)}
+main{max-width:1080px;margin:0 auto;padding:26px 22px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px}
+label{display:block;color:var(--mut);font-size:12px;margin:10px 0 4px}
+input,select,textarea{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 11px;font:inherit}
+input:focus,select:focus{outline:none;border-color:var(--acc)}
+button.primary{background:var(--acc);color:#fff;border:none;border-radius:8px;padding:10px 22px;cursor:pointer;font:inherit;font-weight:600}
+button.primary:disabled{opacity:.45;cursor:not-allowed}
+button.ghost{background:none;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:7px 14px;cursor:pointer;font:inherit}
+.row{display:flex;gap:12px}.row>*{flex:1}
+.tag{display:inline-block;font-size:11px;padding:1px 9px;border-radius:20px;border:1px solid var(--line);color:var(--mut)}
+.tag.P0{color:var(--p0);border-color:var(--p0)}.tag.P1{color:var(--p1);border-color:var(--p1)}.tag.P2{color:var(--p2);border-color:var(--p2)}.tag.P3{color:var(--p3);border-color:var(--p3)}
+.tag.pass{color:var(--ok);border-color:var(--ok)}.tag.fail{color:var(--bad);border-color:var(--bad)}
+.tag.new{color:var(--acc);border-color:var(--acc)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--mut);text-align:left;font-weight:500;padding:7px 9px;border-bottom:1px solid var(--line)}
+td{padding:7px 9px;border-bottom:1px solid rgba(42,47,66,.5)}
+.progress{background:var(--panel2);border-radius:10px;padding:14px;font-family:ui-monospace,Consolas,monospace;font-size:12px;max-height:260px;overflow:auto;color:var(--mut)}
+.progress .stage-ok{color:var(--ok)}
+.finding{border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:10px 0;background:var(--panel2)}
+.finding .head{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.finding .file{font-family:ui-monospace,monospace;font-size:12px;color:var(--acc);cursor:pointer}
+.finding pre{background:#0b0d13;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:12px}
+.mut{color:var(--mut)}.small{font-size:12px}
+summary{cursor:pointer;color:var(--acc);font-size:13px}
+#reportView h2{margin:0 0 4px}
+.pill-row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.pill{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 14px;font-size:12px}
+.pill b{display:block;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+.exempt-form{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.exempt-form>*{flex:1}
+.error{color:var(--bad)}
+details.raw pre{white-space:pre-wrap;word-break:break-all;font-size:11px;max-height:400px;overflow:auto}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ CR-Agent</h1>
+  <span class="mut small">pi-coding-agent · MECE 6 轴视角 · 7 步流程</span>
+  <nav>
+    <button data-view="submit" class="active">提交 CR</button>
+    <button data-view="tasks">任务列表</button>
+    <button data-view="reports">报告列表</button>
+    <button data-view="ledgers">问题账本</button>
+    <button data-view="settings">设置</button>
+  </nav>
+</header>
+<main id="app"></main>
+
+<script>
+const $ = (s,el=document)=>el.querySelector(s);
+const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
+const app = $('#app');
+
+/* ───────── 视图路由 ───────── */
+let view='submit';
+// hash 直达路由：#report/<id> 自动切换到报告列表并展开指定报告（可分享链接）
+const hashReport=()=>{const m=location.hash.match(/^#report\/([\w.-]+)$/);return m?m[1]:null};
+const applyHash=()=>{const rid=hashReport();if(rid){view='reports';$$('nav button').forEach(x=>x.classList.toggle('active',x.dataset.view==='reports'));render().then(()=>viewReport(rid).catch(()=>{}))}};
+window.addEventListener('hashchange',applyHash);
+$$('nav button').forEach(b=>b.onclick=()=>{
+  view=b.dataset.view;
+  $$('nav button').forEach(x=>x.classList.toggle('active',x===b));
+  render();
+});
+
+// 反向代理下自动推导基路径，避免绝对 /api 404
+const CR_BASE=(()=>{const m=location.pathname.match(/^(.*\/proxy\/\d+)\/?/);return m?m[1]:''})();
+async function api(path,opts={}){
+  const r=await fetch(CR_BASE+path,{method:opts.method||(opts.body?'POST':'GET'),headers:{'Content-Type':'application/json'},...opts,body:opts.body?JSON.stringify(opts.body):undefined});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||r.status);
+  return j;
+}
+
+let pollTimer=null;
+
+async function render(){
+  // 切换视图前停止进行中的进度轮询（含任务列表轮询），避免后台泄漏与旧 DOM 更新
+  if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+  if(tasksTimer){clearInterval(tasksTimer);tasksTimer=null;}
+  if(view==='submit') return renderSubmit();
+  if(view==='tasks') return renderTasks();
+  if(view==='settings') return renderSettings();
+  if(view==='reports') return renderReports();
+  if(view==='ledgers') return renderLedgers();
+}
+
+/* ───────── 提交 CR ───────── */
+async function renderSubmit(){
+  app.innerHTML=`
+  <div class="card">
+    <h2 style="margin-top:0">提交 PR 链接，触发 AI Code Review</h2>
+    <p class="mut small">支持 GitHub / GitLab / Bitbucket(含 Bitbucket Server/Stash) 的 PR/MR 链接。首次全量审查，新 commit 提交同一链接将走增量复审（问题跨轮闭环）。</p>
+    <label>PR 链接</label>
+    <input id="prUrl" placeholder="https://github.com/owner/repo/pull/123">
+    <div class="row" style="margin-top:10px;align-items:flex-end">
+      <div><label>模型（留空用默认）</label><select id="mSel"><option value="">默认</option></select></div>
+      <div><label>推理强度</label><select id="tSel"><option>off</option><option>minimal</option><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></div>
+      <div style="flex:0"><label>选项</label><label style="display:flex;gap:6px;align-items:center;color:var(--fg);cursor:pointer"><input type="checkbox" id="forceFull" style="width:auto"> 强制全量重审</label></div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:10px;align-items:center">
+      <button class="primary" id="goBtn">开始审查</button>
+      <span class="mut small" id="goHint"></span>
+    </div>
+  </div>
+  <div class="card" id="progCard" style="display:none">
+    <b>执行进度</b>
+    <div class="progress" id="prog"></div>
+  </div>
+  <div id="reportView"></div>`;
+  // 加载模型列表
+  try{
+    const s=await api('/api/settings');
+    $('#mSel').innerHTML='<option value="">默认（'+esc(s.defaultModel||'未设置')+'）</option>'+
+      (s.models||[]).map(m=>`<option value="${esc(m.id)}">${esc(m.name||m.id)}</option>`).join('');
+    if(!s.models?.length) $('#goHint').textContent='⚠ 设置页未配置模型';
+    if(!s.hasApiKey) $('#goHint').textContent='⚠ 未配置 API Key，请先到设置页';
+  }catch(e){$('#goHint').textContent='⚠ 设置加载失败：'+e.message}
+  $('#goBtn').onclick=()=>startReview();
+}
+
+async function startReview(){
+  const url=$('#prUrl').value.trim();
+  if(!url) return alert('请输入 PR 链接');
+  $('#goBtn').disabled=true;
+  $('#progCard').style.display='';
+  const prog=$('#prog');
+  prog.innerHTML='';
+  try{
+    const {reviewId}=await api('/api/review',{method:'POST',body:{url,forceFull:$('#forceFull').checked,model:$('#mSel').value||undefined,thinking:$('#tSel').value}});
+    // 提交成功立即可见：告知已受理与各阶段预期时长（resolve 静默期长是正常现象，勿误判未提交）
+    prog.innerHTML=`<div>✓ 已提交（${esc(reviewId)}），正在拉取 PR 信息…<br><span class="mut small">resolve 阶段可能静默 1–5 分钟（无 token 时走 git 模式较慢）；出现 [agent] start 后进入模型审查。</span></div>`;
+    // 轮询进度
+    let done=false;
+    let pollFails=0;
+    const t0=Date.now();
+    const timer=setInterval(async()=>{
+      try{
+        const p=await api(`/api/review/${reviewId}/progress`);
+        pollFails=0;
+        // 只渲染最近 500 条，避免 events 达数万时每 1.5s 全量重建 innerHTML 卡死主线程
+        const evAll=p.events||[];
+        const evs=evAll.length>500?evAll.slice(-500):evAll;
+        prog.innerHTML=(evAll.length>500?`<div class="small mut">（仅显示最近 500 / ${evAll.length} 条事件）</div>`:'')+evs.map(e=>{
+          const st=e.status==='done'||e.status==='ok'?'stage-ok':'';
+          const det=e.pr?` ${esc(e.pr.repo)}#${esc(e.pr.number)}`:e.mode?` mode=${esc(e.mode)}`:e.model?` ${esc(e.model)}`:e.error?` <span class="error">${esc(e.error)}</span>`:'';
+          const label=e.stage==='agent-event'?(e.event&&e.event.type?e.event.type:'agent'):(e.status||'');
+          return `<div class="${st}">[${e.stage}] ${label}${det}</div>`;
+        }).join('\n');
+        if(p.agentEventsDropped)prog.innerHTML+=`<div class="small mut">（${p.agentEventsDropped} 条 agent 事件超限丢弃）</div>`;
+        // resolve 阶段静默超过 3 分钟：给出诊断提示（代码平台不可达/未配 token 常见）
+        const hasResolveDone=p.events.some(e=>e.stage==='resolve'&&e.status==='done');
+        if(!hasResolveDone&&!p.done&&Date.now()-t0>3*60*1000){
+          prog.innerHTML+=`<div class="small" style="color:#c80">⚠ 拉取 PR 信息已超 3 分钟：目标机到该代码平台的网络可能受限（或未配置平台 token），仍在重试中（git 兑底最长约 10 分钟）…</div>`;
+        }
+        if(p.done){
+          clearInterval(timer);pollTimer=null;
+          $('#goBtn').disabled=false;
+          if(p.error){prog.innerHTML+=`<div class="error">✗ ${esc(p.error)}${p.errorStatus===429?'（轮次上限，需人工确认）':''}</div>`;return;}
+          const rep=await api(`/api/reports/${p.reportId}`);
+          $('#reportView').innerHTML=renderReport(rep);
+        }
+      }catch(e){ /* 单次失败重试，连续 5 次才终止（防首次瞬时网络抖动） */
+        if(++pollFails>=5&&pollTimer){clearInterval(pollTimer);pollTimer=null;$('#goBtn').disabled=false;prog.innerHTML+=`<div class="error">✗ 进度查询连续失败：${esc(e.message)}</div>`;}
+      }
+    },1500);
+    pollTimer=timer;
+  }catch(e){
+    $('#goBtn').disabled=false;
+    prog.innerHTML=`<div class="error">${esc(e.message)}</div>`;
+  }
+}
+
+/* ───────── 报告渲染（分层：作者摘要 → 完整 findings → 原始 JSON） ───────── */
+function renderReport(r){
+  const sevTag=s=>`<span class="tag ${s}">${s}</span>`;
+  const evTag=l=>l==='test-confirmed'?'<span class="tag pass">测试实证</span>':l==='test-falsified'?'<span class="tag P3">测试证伪</span>':l==='code-confirmed'?'<span class="tag">代码实证</span>':l==='unverified'?'<span class="tag">未验证</span>':'';
+  const findingHtml=f=>`
+    <div class="finding">
+      <div class="head">${sevTag(f.severity)}<b>${esc(f.title)}</b>
+        <span class="tag">${esc(f.category||'')}</span>
+        ${evTag(f.evidence_level)}
+        ${f.introduced_by==='pre-existing'?'<span class="tag">存量'+(f.pre_existing_detected==='programmatic'?'（程序判定）':'')+'</span>':''}
+        ${f.duplicates>1?`<span class="tag">×${f.duplicates} 桶命中</span>`:''}
+        ${f.line_adjusted?'<span class="tag">行号校正</span>':''}
+        ${f.confidence!=null?`<span class="tag">置信 ${(f.confidence*100)|0}%</span>`:''}
+        <span class="file" title="查看代码">${esc(f.file)}${f.line?':'+esc(f.line):''}</span></div>
+      ${f.code_snippet?`<pre>${esc(f.code_snippet)}</pre>`:''}
+      ${f.evidence?`<p class="small"><b class="mut">证据：</b>${esc(f.evidence)}</p>`:''}
+      ${f.evidence_level==='unverified'&&f.evidence_gap?`<p class="small mut">证据缺口：${esc(f.evidence_gap)}</p>`:''}
+      ${f.impact?`<p class="small"><b class="mut">影响：</b>${esc(f.impact)}</p>`:''}
+      ${f.suggestion?`<p class="small"><b style="color:var(--ok)">修复建议：</b>${esc(f.suggestion)}</p>`:''}
+    </div>`;
+  const summary=r.author_summary||{};
+  const must=summary.must_fix||[], should=summary.should_fix||[], nice=summary.nice_to_have||[];
+  return `
+  <div class="card">
+    <h2>${esc(r.conclusion)} ${esc(r.pr?.title||r.pr?.repo||'')} 
+      <span class="mut small" style="font-weight:400">${esc(r.pr?.repo)}#${esc(r.pr?.number)} · round ${esc(r.review?.round)} · ${esc(r.review?.mode)}${r.review?.fast_path?' · fast-path':''} · ${esc(r.review?.model||'')} · ${((r.review?.elapsed_ms||0)/1000).toFixed(0)}s</span></h2>
+    <p>${esc(r.one_line||'')}</p>
+    <p class="mut small">${esc(r.impact_summary||'')}</p>
+    <div class="pill-row">
+      <div class="pill"><b>${r.findings?.length||0}</b>新问题</div>
+      <div class="pill"><b>${(r.findings||[]).filter(f=>f.severity==='P0'||f.severity==='P1').length}</b>P0/P1</div>
+      <div class="pill"><b>${r.review?.previous_findings?.length||0}</b>历史复核</div>
+      <div class="pill"><b>${(r.decision_changes||[]).length}</b>跨仓查证</div>
+      <div class="pill"><b>${r.metrics?.perspectives_covered?.length||0}/6</b>一级视角覆盖</div>
+      ${r._toolCalls?`<div class="pill"><b>${r._toolCalls}</b>工具调用</div>`:''}
+      ${r.ledger_stats?.adoption_rate!=null?`<div class="pill"><b>采纳率 ${(r.ledger_stats.adoption_rate*100)|0}%</b></div>`:''}
+      ${r.review?.review_bundles?.length||r.review_bundles?.length?`<div class="pill"><b>${(r.review_bundles||r.review.review_bundles).length}</b>分桶</div>`:''}
+      ${/* needs_human_reason 只写在账本，不进报告；轮次上限由 429 错误路径提示 */''}
+    </div>
+    ${r.blockers?.length?`<p class="small"><b style="color:var(--bad)">阻塞项：</b>${r.blockers.map(esc).join(', ')}</p>`:''}
+  </div>
+  <div class="card">
+    <b>作者摘要</b>（必改 ${must.length} / 建议 ${should.length} / 可选 ${nice.length}）
+    ${must.length?`<h4 style="color:var(--bad);margin-bottom:6px">⛔ 必改</h4>${must.map(f=>`<p class="small">· ${sevTag(f.severity)} <b>${esc(f.title)}</b> <span class="file">${esc(f.where||'')}</span><br>&nbsp;&nbsp;${esc(f.suggestion||'')}</p>`).join('')}`:''}
+    ${should.length?`<h4 style="color:var(--warn);margin-bottom:6px">⚠ 建议修复</h4>${should.map(f=>`<p class="small mut">· <b>${esc(f.title)}</b> ${esc(f.where||'')}</p>`).join('')}`:''}
+    ${r.release_plan?.preconditions?.length?`<h4 style="margin-bottom:6px">🚀 上线前置</h4><p class="small">${r.release_plan.preconditions.map(esc).join('<br>')}</p>`:''}
+    ${r.release_plan?.rollback?.length?`<h4 style="margin-bottom:6px">↩ 回滚预案</h4><p class="small">${r.release_plan.rollback.map(esc).join('<br>')}</p>`:''}
+  </div>
+  <div class="card">
+    <b>问题明细</b>
+    ${(r.findings||[]).map(findingHtml).join('')||'<p class="mut">无</p>'}
+  </div>
+  ${(r.review?.previous_findings||[]).length?`<div class="card"><b>历史问题复核</b><table><tr><th>ID</th><th>状态</th><th>说明</th></tr>
+    ${r.review.previous_findings.map(p=>`<tr><td>${esc(p.id||'')}</td><td>${p.status==='fixed'?'<span class="tag pass">已修复</span>':p.status==='still_exists'?'<span class="tag P1">仍存在</span>':'<span class="tag">'+esc(p.status)+'</span>'}</td><td class="small">${esc(p.note||'')}</td></tr>`).join('')}</table></div>`:''}
+  ${(r.decision_changes||[]).length?`<div class="card"><b>跨仓查证</b><table><tr><th>Trace</th><th>判定点</th><th>状态</th><th>证据</th></tr>
+    ${r.decision_changes.map(d=>`<tr><td>${esc(d.trace_id)}</td><td class="small">${esc(d.decision||'')}</td><td>${statusTag(d.status)}</td><td class="small mut">${esc((d.evidence||'').slice(0,120))}</td></tr>`).join('')}</table></div>`:''}
+  ${(r.tests||[]).length?`<div class="card"><b>测试建议</b>${r.tests.map(t=>`<p class="small">· [${esc(t.priority)}] ${esc(t.scenario)} <span class="mut">${esc(t.why||'')}</span></p>`).join('')}</div>`:''}
+    ${(r.verification?.degraded_steps||[]).length?`<div class="card"><b>降级步骤声明</b>${r.verification.degraded_steps.map(s=>`<p class="small">· ${esc(s)}</p>`).join('')}</div>`:''}
+    ${(r.checked_paths||[]).length?`<div class="card"><b>已检查路径（${r.checked_paths.length}）</b><p class="small mut">${r.checked_paths.map(esc).join('、')}</p></div>`:''}
+    <div class="card details raw"><details><summary>原始 JSON 报告</summary><pre>${esc(JSON.stringify(r,null,2))}</pre></details></div>`;
+}
+const statusTag=s=>s==='consistent'?'<span class="tag pass">一致</span>':s==='conflicting'?'<span class="tag P0">冲突</span>':s==='needs_human'?'<span class="tag P1">需人工</span>':'<span class="tag">未验证</span>';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// ISO 时间（UTC）→ 本地时区显示（报告列表 / 报告详情通用）
+const fmtLocal=iso=>{if(!iso)return '';const d=new Date(iso);return isNaN(d)?String(iso).slice(0,19).replace('T',' '):d.toLocaleString('sv-SE',{hour12:false})};
+
+/* ───────── 任务列表 ───────── */
+let tasksTimer=null;
+async function renderTasks(){
+  app.innerHTML='<div class="card"><b>审查任务</b><span id="trun" class="mut small" style="margin-left:10px"></span><div id="tlist"><p class="mut">加载中…</p></div></div>';
+  const refresh=async()=>{
+    try{
+      const r=await api('/api/tasks');
+      $('#trun').textContent=`运行中 ${r.running}/${r.maxConcurrent}（任务在完成后保留 2 小时）`;
+      if(!r.tasks.length) return $('#tlist').innerHTML='<p class="mut">暂无任务，去「提交 CR」发起一个审查</p>';
+      $('#tlist').innerHTML=`<table><tr><th>开始时间</th><th>PR</th><th>状态</th><th>模式</th><th>模型</th><th>进度</th><th>报告</th></tr>
+        ${r.tasks.map(t=>{
+          const st=t.done?(t.error?`<span class="tag fail">失败</span>`:`<span class="tag pass">完成</span>`):`<span class="tag P1">运行中</span>`;
+          const modeCell=(t.mode?t.mode+' r'+(t.round||''):'-')+(t.head?`<span class="small mut" title="审查时 head"> @${esc(t.head)}</span>`:'');
+          const prog=t.done?(t.error?esc(String(t.error).slice(0,60)):`${esc(t.events)} 事件`):(t.bundleProgress?`桶 ${esc(t.bundleProgress)} · ${esc(t.events)} 事件`:`${esc(t.events)} 事件`);
+          const rep=t.reportId?`<a href="#report/${esc(t.reportId)}" onclick="viewReport('${esc(t.reportId)}');return false">查看</a>`:'';
+          return `<tr><td class="small">${esc(fmtLocal(t.startedAt))}</td><td>${t.repo?esc(t.repo)+'#'+esc(t.pr):esc(t.id)}</td>
+          <td>${st}</td><td class="small">${modeCell}</td><td class="small mut">${esc(t.model||'-')}</td>
+          <td class="small">${prog}</td><td>${rep}</td></tr>`;
+        }).join('')}</table>`;
+    }catch(e){ $('#tlist').innerHTML=`<p class="error">${esc(e.message)}</p>`; }
+  };
+  await refresh();
+  // 运行中任务存在时 15s 自动刷新；全部完成停止轮询
+  if(tasksTimer){clearInterval(tasksTimer);tasksTimer=null;}
+  tasksTimer=setInterval(async()=>{
+    try{ const r=await api('/api/tasks'); if(!r.running){clearInterval(tasksTimer);tasksTimer=null;} await refresh(); }catch{}
+  },15000);
+}
+
+/* ───────── 报告列表 ───────── */
+async function renderReports(){
+  app.innerHTML='<div class="card"><b>审查报告</b><div id="rlist"><p class="mut">加载中…</p></div></div>';
+  try{
+    const list=await api('/api/reports');
+    if(!list.length) return $('#rlist').innerHTML='<p class="mut">暂无报告，先去提交一个 PR</p>';
+    $('#rlist').innerHTML=`<table><tr><th>时间</th><th>PR</th><th>结论</th><th>轮次</th><th>问题</th><th>模型</th><th></th></tr>
+      ${list.map(x=>`<tr><td class="small">${esc(fmtLocal(x.at))}</td><td>${esc(x.repo)}#${esc(x.pr)}</td>
+      <td>${x.conclusion==='通过'?'<span class="tag pass">通过</span>':'<span class="tag fail">不通过</span>'}</td>
+      <td>r${esc(x.round)} ${x.mode==='incremental'?'增量':'全量'}${x.head?`<span class="small mut" title="审查时 head"> @${esc(x.head)}</span>`:''}</td>
+      <td>${esc(x.findings)}（P0/P1:${esc(x.p0p1)}）</td><td class="small mut">${esc(x.model||'')}</td>
+      <td><button class="ghost" data-rep="${esc(x.id)}">查看</button></td></tr>`).join('')}</table>`;
+    $('#rlist').querySelectorAll('button[data-rep]').forEach(b=>b.onclick=()=>viewReport(b.dataset.rep));
+  }catch(e){$('#rlist').innerHTML=`<p class="error">${esc(e.message)}</p>`}
+}
+window.viewReport=async id=>{
+  try{
+    const r=await api(`/api/reports/${id}`);
+    // 可分享直达链接：#report/<id>，他人打开自动定位到该报告
+    if(location.hash!=='#report/'+id) location.hash='#report/'+id;
+    let rp=document.getElementById('rp');
+    if(!rp){rp=document.createElement('div');rp.id='rp';app.appendChild(rp);}
+    rp.innerHTML=`${renderReport(r)}<button class="ghost" onclick="document.getElementById('rp').remove();location.hash=''">关闭</button>`;
+    window.scrollTo(0,document.body.scrollHeight);
+  }catch(e){
+    alert(`报告不存在或已过期（${e.message}）`);
+  }
+};
+
+/* ───────── 问题账本 ───────── */
+async function renderLedgers(){
+  app.innerHTML='<div class="card"><b>PR 审查账本</b><p class="mut small">问题跨轮闭环：open/still_exists 持续跟踪，fixed 闭环；豁免后不再重复报告；查证失败 2 轮自动升级 needs_human。</p><div id="llist"><p class="mut">加载中…</p></div></div>';
+  try{
+    const list=await api('/api/ledger');
+    if(!list.length) return $('#llist').innerHTML='<p class="mut">暂无账本</p>';
+    $('#llist').innerHTML=list.map((l,i)=>`
+      <details data-led="${i}" style="margin:8px 0"><summary>${esc(l.repo)}#${esc(String(l.pr))} — ${esc(String(l.stats.rounds))} 轮 · open ${esc(String(l.stats.open))} · fixed ${esc(String(l.stats.fixed))} · needs_human ${esc(String(l.stats.needs_human))} · 豁免 ${esc(String(l.stats.exempt))}</summary>
+      <div class="small" style="padding:8px 14px">
+        ${(l.stats.by_severity&&Object.entries(l.stats.by_severity).map(([k,v])=>`<span class="tag ${k}">${k}:${v}</span>`).join(' '))||''}
+        <div class="ldetail" data-repo="${esc(l.repo)}" data-pr="${esc(String(l.pr))}"><p class="mut">展开加载问题明细…</p></div>
+      </div></details>`).join('');
+    // 展开时拉取该 PR 完整账本：findings 明细 + 豁免管理
+    $$('#llist details[data-led]').forEach(d=>d.addEventListener('toggle',()=>{
+      if(!d.open) return;
+      const box=d.querySelector('.ldetail');
+      if(box.dataset.loaded) return;
+      loadLedgerDetail(box);
+    }));
+  }catch(e){$('#llist').innerHTML=`<p class="error">${esc(e.message)}</p>`}
+}
+async function loadLedgerDetail(box){
+  box.dataset.loaded='1';
+  const repo=box.dataset.repo, pr=box.dataset.pr;
+  try{
+    const l=await api(`/api/ledger?repo=${encodeURIComponent(repo)}&pr=${encodeURIComponent(pr)}`);
+    const fs=(l.findings||[]).map(f=>`
+      <div class="row small" style="align-items:center;margin:2px 0">
+        <span class="tag ${esc(f.severity)}">${esc(f.severity)}</span>
+        <span style="flex:2">${esc(f.persist_id)} ${esc(f.title)} <span class="mut">(${esc(f.status)}${f.file?` · ${esc(f.file)}:${esc(String(f.line??''))}`:''})</span></span>
+        ${f.status!=='fixed'&&f.status!=='not_applicable'?`<button class="ghost" data-exf="${esc(f.file||'')}" data-ext="${esc(f.title||'')}" style="flex:0">豁免</button>`:''}
+      </div>`).join('')||'<p class="mut">无问题记录</p>';
+    const exs=(l.exempt||[]).map((e,i)=>`
+      <div class="row small" style="align-items:center;margin:2px 0">
+        <span style="flex:2">豁免：${esc(e.file||'(任意文件)')}${e.title_keyword?` · 关键词「${esc(e.title_keyword)}」`:''}${e.reason?` · ${esc(e.reason)}`:''} <span class="mut">by ${esc(e.exempted_by||'user')}</span></span>
+        <button class="ghost" data-exdel="${i}" style="flex:0">移除</button>
+      </div>`).join('')||'<p class="mut">暂无豁免项</p>';
+    box.innerHTML=`<p style="margin:8px 0 2px"><b>问题明细</b></p>${fs}<p style="margin:8px 0 2px"><b>豁免清单</b></p>${exs}`;
+    box.querySelectorAll('button[data-exf]').forEach(b=>b.onclick=async()=>{
+      const reason=prompt(`豁免 ${b.dataset.exf||'该文件'} 的「${b.dataset.ext}」？输入原因（可选）：`,'');
+      if(reason===null) return;
+      try{
+        await api('/api/ledger/exempt',{method:'POST',body:{repo,pr:Number(pr),file:b.dataset.exf||undefined,titleKeyword:b.dataset.ext,reason:reason||'前端豁免',exemptedBy:'web'}});
+        delete box.dataset.loaded; loadLedgerDetail(box);
+      }catch(e){alert('豁免失败：'+e.message)}
+    });
+    box.querySelectorAll('button[data-exdel]').forEach(b=>b.onclick=async()=>{
+      if(!confirm('移除该豁免项？')) return;
+      try{
+        await api('/api/ledger/exempt',{method:'DELETE',body:{repo,pr:Number(pr),index:Number(b.dataset.exdel)}});
+        delete box.dataset.loaded; loadLedgerDetail(box);
+      }catch(e){alert('移除失败：'+e.message)}
+    });
+  }catch(e){box.innerHTML=`<p class="error">${esc(e.message)}</p>`}
+}
+
+/* ───────── 设置页 ───────── */
+async function renderSettings(){
+  app.innerHTML='<div class="card"><b>设置</b><p class="mut small">端点（OpenAI 兼容）与模型管理。凭证仅存本地 data/settings.json。</p><div id="sbody"><p class="mut">加载中…</p></div></div>';
+  let s;
+  try{ s=await api('/api/settings'); }catch(e){ return $('#sbody').innerHTML=`<p class="error">${esc(e.message)}</p>`; }
+  let modelSeq=0;
+  const modelRowHtml=m=>{const i=modelSeq++;
+    return `<div class="row" style="align-items:center;margin:4px 0">
+      <input data-mi="${i}" data-mf="id" value="${esc(m.id)}" placeholder="model id（如 gpt-4o / deepseek-chat / 自定义名称）">
+      <input data-mi="${i}" data-mf="name" value="${esc(m.name||'')}" placeholder="显示名">
+      <input data-mi="${i}" data-mf="contextWindow" value="${esc(String(m.contextWindow||128000))}" style="flex:.5">
+      <button class="ghost" data-mdel="${i}" style="flex:0">删除</button>
+    </div>`};
+  $('#sbody').innerHTML=`
+    <div class="row"><div>
+      <label>端点 Base URL（OpenAI 兼容）</label>
+      <input id="sBaseUrl" value="${esc(s.baseUrl)}" placeholder="https://api.openai.com/v1（任意 OpenAI 兼容端点）">
+    </div><div>
+      <label>Provider ID</label>
+      <input id="sProviderId" value="${esc(s.providerId)}">
+    </div></div>
+    <label>API Key / Token（Bearer）${s.hasApiKey?'<span class="tag pass">已配置</span>':''}</label>
+    <input id="sApiKey" type="password" placeholder="${s.hasApiKey?'留空则不修改':'sk-xxx 或 token'}">
+    <label style="margin-top:10px">自定义域名→平台映射（每行 host=platform，如 abc.com=bitbucket）</label>
+    <textarea id="sHostPlatforms" rows="2" placeholder="abc.com=bitbucket&#10;git.corp.example.com=gitlab">${esc(Object.entries(s.hostPlatforms||{}).map(([h,p])=>h+'='+p).join('\n'))}</textarea>
+    <label style="margin-top:10px">Web/API 域名→SSH git 主机（每行 from=to；PR 链接域名与 SSH clone 域名不一致时配置，如 git.web.corp.com=ssh.git.corp.com）</label>
+    <textarea id="sSshHostMap" rows="2" placeholder="git.web.corp.com=ssh.git.corp.com">${esc(Object.entries(s.sshHostMap||{}).map(([h,p])=>h+'='+p).join('\n'))}</textarea>
+    <label style="margin-top:10px">平台 Token（每行 host=token，如 github.com=xxxx；API 与 git 通道共用；已配置项显示 ****，留空不修改）</label>
+    <textarea id="sTokens" rows="2" placeholder="github.com=xxxx">${esc(Object.entries(s.platformTokens||{}).map(([h,v])=>h+'='+v).join('\n'))}</textarea>
+    <label style="margin-top:10px">并发审查上限（1~20，默认 3；每单起一个模型会话 + 临时 git clone，过大可能打穿主机资源）</label>
+    <input id="sMaxConc" type="number" min="1" max="20" value="${esc(String(s.maxConcurrentReviews??3))}" style="max-width:120px">
+    <label style="margin-top:10px">桶间并行度（1~8，默认 1=串行；单审内分桶 agent 并发会话数，并行时 token 峰值=并发数×单桶，怕端点限流勿调高）</label>
+    <input id="sBundleConc" type="number" min="1" max="8" value="${esc(String(s.bundleConcurrency??1))}" style="max-width:120px">
+<label style="margin-top:10px">同 PR 审查轮次上限（1~20，默认 3；同一 PR 累计完成轮数超限后拒绝再审，需人工确认后重置账本）</label>
+<input id="sMaxRounds" type="number" min="1" max="20" value="${esc(String(s.maxRounds??3))}" style="max-width:120px">
+    <label style="margin-top:14px;display:flex;align-items:center;gap:8px"><input id="sVerifierEnabled" type="checkbox" ${s.verifierEnabled===false?'':'checked'}> P0/P1 独立验证会话（对锚点定级的高风险问题起独立会话复核证据链，防谎报定级；失败不阻断主报告）</label>
+    <label style="margin-top:6px">Verifier 专属端点（留空 = 用上方主端点）</label>
+    <input id="sVerifierBaseUrl" type="text" placeholder="https://.../v1" value="${esc(String(s.verifierBaseUrl||''))}">
+    <label style="margin-top:6px">Verifier 专属 API Key ${s.hasVerifierKey?'<span class="tag pass">已配置</span>':''}（留空则不修改/不设置）</label>
+    <input id="sVerifierApiKey" type="password" placeholder="${s.hasVerifierKey?'留空则不修改':'sk-xxx（不填则用主 API Key）'}">
+    <label style="margin-top:6px">Verifier 专属模型（留空 = 用 worker 默认模型；需为 OpenAI 兼容模型名，不在列表中会自动注册）</label>
+    <input id="sVerifierModel" type="text" placeholder="如 claude-sonnet-4-5（不填则用默认模型）" value="${esc(String(s.verifierModel||''))}" list="sModelIds">
+    <datalist id="sModelIds">${(s.models||[]).map(m=>`<option value="${esc(m.id)}">`).join('')}</datalist>
+    <div class="row" style="margin-top:10px"><div>
+      <label>默认模型</label>
+      <select id="sDefaultModel">${(s.models||[]).map(m=>`<option value="${esc(m.id)}" ${m.id===s.defaultModel?'selected':''}>${esc(m.name||m.id)}</option>`).join('')}</select>
+    </div><div>
+      <label>默认推理强度</label>
+      <select id="sThinking">${['off','minimal','low','medium','high','xhigh','max'].map(v=>`<option value="${v}" ${s.defaultThinking===v?'selected':''}>${v}</option>`).join('')}</select>
+    </div></div>
+    <div style="margin:14px 0;display:flex;gap:10px">
+      <button class="primary" id="sSave">保存</button>
+      <button class="ghost" id="sFetchModels">从端点拉取模型</button>
+      <button class="ghost" id="sAddModel">手动添加模型</button>
+      <button class="ghost" id="sTest">测试端点</button>
+    </div>
+    <label>模型列表（${(s.models||[]).length} 个）</label>
+    <div id="modelList">${(s.models||[]).map(modelRowHtml).join('')||'<p class="mut small">暂无模型</p>'}</div>
+    <p class="mut small" style="margin-top:18px">审查视角为 MECE 一级 6 轴（见 docs/mece-perspectives.md），不再在设置页枚举。环境变量：CR_AGENT_DATA · PORT。密钥保存于 data/pi-home/auth.json。</p>`;
+
+  const collectModels=()=>{
+    const ids=$$('#modelList input[data-mf="id"]');
+    return ids.map((el,i)=>({
+      id:el.value.trim(),
+      name:$(`#modelList input[data-mi="${el.dataset.mi}"][data-mf="name"]`).value.trim()||el.value.trim(),
+      contextWindow:Number($(`#modelList input[data-mi="${el.dataset.mi}"][data-mf="contextWindow"]`).value)||128000,
+    })).filter(m=>m.id);
+  };
+  $('#sSave').onclick=async()=>{
+    try{
+      const body={baseUrl:$('#sBaseUrl').value.trim(),providerId:$('#sProviderId').value.trim()||'custom',
+        defaultModel:$('#sDefaultModel').value,defaultThinking:$('#sThinking').value,models:collectModels(),
+        maxConcurrentReviews:Number($('#sMaxConc').value)||3,
+        bundleConcurrency:Number($('#sBundleConc').value)||1,
+        maxRounds:Number($('#sMaxRounds').value)||3,
+        verifierEnabled:$('#sVerifierEnabled').checked,
+        verifierBaseUrl:$('#sVerifierBaseUrl').value.trim(),
+        verifierModel:$('#sVerifierModel').value.trim()};
+      const vk=$('#sVerifierApiKey').value.trim(); if(vk) body.verifierApiKey=vk;
+      const k=$('#sApiKey').value.trim(); if(k) body.apiKey=k;
+      // 自定义域名→平台映射（每行 host=platform）
+      const hp={}; $('#sHostPlatforms').value.split('\n').map(l=>l.trim()).filter(Boolean).forEach(l=>{
+        const i=l.indexOf('='); if(i>0) hp[l.slice(0,i).trim()]=l.slice(i+1).trim();
+      });
+      body.hostPlatforms=hp;
+      // Web→SSH 主机映射（每行 from=to）
+      const shm={}; $('#sSshHostMap').value.split('\n').map(l=>l.trim()).filter(Boolean).forEach(l=>{
+        const i=l.indexOf('='); if(i>0) shm[l.slice(0,i).trim()]=l.slice(i+1).trim();
+      });
+      body.sshHostMap=shm;
+      // 平台 Token（每行 host=token；mask 占位 **** 回传占位符，server 端恢复原值）
+      const pt={}; $('#sTokens').value.split('\n').map(l=>l.trim()).filter(Boolean).forEach(l=>{
+        const i=l.indexOf('='); if(i>0){const h=l.slice(0,i).trim(),v=l.slice(i+1).trim(); if(v) pt[h]=v;}
+      });
+      body.platformTokens=pt;
+      const r=await api('/api/settings',{method:'PUT',body});
+      alert('已保存'); renderSettings();
+    }catch(e){alert('保存失败：'+e.message)}
+  };
+  $('#sFetchModels').onclick=async()=>{
+    try{
+      const body={baseUrl:$('#sBaseUrl').value.trim(),providerId:$('#sProviderId').value.trim()||'custom'};
+      const k=$('#sApiKey').value.trim(); if(k) body.apiKey=k;
+      await api('/api/settings',{method:'PUT',body});
+      const r=await api('/api/settings/models/fetch',{method:'POST',body:{}});
+      const cur=collectModels(); const curIds=new Set(cur.map(m=>m.id));
+      r.models.forEach(id=>{if(!curIds.has(id))cur.push({id,name:id})});
+      $('#modelList').innerHTML=cur.map(modelRowHtml).join('');
+      bindDelete();
+      alert(`拉取到 ${r.models.length} 个模型，已合并到列表（点击保存生效）`);
+    }catch(e){alert('拉取失败：'+e.message+'\n（可手动添加模型）')}
+  };
+  $('#sAddModel').onclick=()=>{
+    $('#modelList').insertAdjacentHTML('beforeend',modelRowHtml({id:'',name:'',contextWindow:128000}));
+    bindDelete();
+  };
+  const bindDelete=()=>{$$('#modelList button[data-mdel]').forEach(b=>b.onclick=()=>{b.closest('.row').remove()})};
+  bindDelete();
+  $('#sTest').onclick=async()=>{
+    try{
+      const body={baseUrl:$('#sBaseUrl').value.trim()};
+      const k=$('#sApiKey').value.trim(); if(k) body.apiKey=k;
+      await api('/api/settings',{method:'PUT',body});
+      const r=await api('/api/settings/test',{method:'POST',body:{model:$('#sDefaultModel').value}});
+      alert(`端点可用 ✓ 模型 ${r.model}\n${r.sample}`);
+    }catch(e){alert('测试失败：'+e.message)}
+  };
+}
+render();
+// 首次进入：若带 #report/<id> 直达链接，自动定位到该报告
+applyHash();
+</script>
+</body>
+</html>
