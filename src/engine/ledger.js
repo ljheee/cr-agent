@@ -37,7 +37,17 @@ export class Ledger {
     const l = new Ledger(path.join(dir, `${slug}.json`));
     try {
       l.data = { ...l.data, ...JSON.parse(await readFile(l.file, "utf8")) };
-    } catch { /* 新账本 */ }
+    } catch (e) {
+      if (e?.code === "ENOENT") { /* 新账本 */ }
+      else {
+        // 损坏 JSON：挪走坏文件再重置，避免无提示覆盖历史
+        try {
+          const { rename } = await import("node:fs/promises");
+          await rename(l.file, `${l.file}.corrupt.${Date.now()}`);
+        } catch { /* ignore */ }
+        l.data._load_error = `账本 JSON 损坏已重置：${e?.message || e}`;
+      }
+    }
     l.data.repo = repo; l.data.pr = pr;
     return l;
   }
@@ -190,8 +200,16 @@ export class Ledger {
 
   matchExisting(f) {
     // needs_human 也可匹配：模型复核确认仍存在时更新 last_seen/history，但状态不被降级（见 applyRound 守卫）
-    return this.data.findings.find((x) => x.status === "open" || x.status === "still_exists" || x.status === "needs_human"
-      ? x.file === f.file && x.title === f.title : false);
+    const norm = (t) => String(t || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const fTitle = norm(f.title);
+    return this.data.findings.find((x) => {
+      if (!(x.status === "open" || x.status === "still_exists" || x.status === "needs_human")) return false;
+      if (x.file !== f.file) return false;
+      if (x.title === f.title) return true;
+      if (fTitle && norm(x.title) === fTitle) return true;
+      if (x.persist_id && f.id && x.persist_id === f.id) return true;
+      return false;
+    });
   }
 
   addExempt(entry) {
@@ -212,18 +230,17 @@ export class Ledger {
   }
 
   stats() {
-    const by = (k) => this.data.findings.reduce((a, f) => ((a[f[k]] = (a[f[k]] || 0) + 1), a), {});
-    // 采纳率（fix detector 思路：后续轮模型复核 fixed / 仍存在 / 升级的比例）。
-    // 只计真实 findings：trace: 查证条目是 agent 自身的查证闭环（关闭≠作者采纳），
-    // needs_human 是 agent 失败升级态——均不计入分母（注释与代码一致：judged = fixed+not_applicable+still_exists）
+    // 采纳率与计数口径统一：trace: 查证条目不计入 total/by_*/open（与 adoption_rate 一致）
     const realFindings = this.data.findings.filter((f) => !String(f.persist_id || "").startsWith("trace:"));
+    const by = (k) => realFindings.reduce((a, f) => ((a[f[k]] = (a[f[k]] || 0) + 1), a), {});
     const closed = realFindings.filter((f) => ["fixed", "not_applicable"].includes(f.status));
     const judged = closed.length + realFindings.filter((f) => f.status === "still_exists").length;
     return {
       rounds: this.data.rounds.length,
-      total_findings: this.data.findings.length,
-      open: this.data.findings.filter((f) => f.status === "open" || f.status === "still_exists").length,
-      fixed: this.data.findings.filter((f) => f.status === "fixed").length,
+      total_findings: realFindings.length,
+      open: realFindings.filter((f) => f.status === "open" || f.status === "still_exists").length,
+      fixed: realFindings.filter((f) => f.status === "fixed").length,
+      // needs_human 含 trace: 升级态（查证失败升级是运营信号，与 total_findings 口径分离）
       needs_human: this.data.findings.filter((f) => f.status === "needs_human").length,
       by_severity: by("severity"), by_status: by("status"),
       exempt: this.data.exempt.length,

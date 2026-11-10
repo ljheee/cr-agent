@@ -31,14 +31,25 @@ export function extractSnippetLines(snippet) {
 /** 空白折叠（模型引用常把 tab 换空格/多空格压一行）：匹配两侧统一折叠后再比子串 */
 const collapse = (s) => s.split(/\s+/).join(" ");
 
+/** 路径必须落在 repoDir 内（防 ../ 逃逸越界读） */
+function resolveInsideRepo(repoDir, file) {
+  const rel = String(file || "").replace(/\\/g, "/");
+  if (!rel || rel.includes("\0") || path.isAbsolute(rel)) return null;
+  const root = path.resolve(repoDir);
+  const resolved = path.resolve(root, rel);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+  return { root, rel, resolved };
+}
+
 /** 定位 finding.file 对应的源文件候选：直接拼路径；失败按 basename 收集全部同名文件，
  *  路径后缀（目录链）一致者优先——同名不同目录（src/ vs test/fixtures/）不能只取首个 */
 async function locateFile(repoDir, file) {
-  const rel = String(file || "");
-  const direct = path.join(repoDir, rel);
+  const bound = resolveInsideRepo(repoDir, file);
+  if (!bound) return [];
+  const { root, rel, resolved: direct } = bound;
   try { if ((await stat(direct)).isFile()) return [direct]; } catch { /* fallback */ }
   const base = path.basename(rel);
-  if (!base) return [];
+  if (!base || base === ".." || base === ".") return [];
   let visited = 0;
   const candidates = [];
   const walk = async (dir) => {
@@ -50,10 +61,12 @@ async function locateFile(repoDir, file) {
       if (e.isDirectory()) {
         if (e.name === ".git" || e.name === "node_modules") continue;
         await walk(p);
-      } else if (e.name === base) candidates.push(p);
+      } else if (e.name === base && (p === root || p.startsWith(root + path.sep))) {
+        candidates.push(p);
+      }
     }
   };
-  await walk(repoDir);
+  await walk(root);
   // 排序：候选路径以 path.sep + file 相对路径为后缀的排前（path.sep 锚定：防 mysrc/ 误排 src/）
   const suffix = path.sep + rel.split("/").join(path.sep);
   return candidates.sort((a, b) => Number(b.endsWith(suffix)) - Number(a.endsWith(suffix)));
@@ -82,8 +95,12 @@ export async function verifySnippets(report, repoDir) {
         try { fileText = await readFile(loc, "utf8"); } catch { continue; }
         textCache.set(loc, fileText);
       }
-      const hay = collapse(fileText);
-      if (lines.some((l) => hay.includes(collapse(l)))) { hit = true; break; }
+      // 按行折叠匹配：避免整文件 collapse 后跨行拼接的伪造片段误命中
+      const hayLines = fileText.split(/\r?\n/).map(collapse);
+      if (lines.some((l) => {
+        const needle = collapse(l);
+        return needle && hayLines.some((hl) => hl.includes(needle));
+      })) { hit = true; break; }
     }
     if (hit) continue;
     f._evidence_level_model = f.evidence_level;

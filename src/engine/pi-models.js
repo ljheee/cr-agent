@@ -10,15 +10,19 @@ export class PiRunnerError extends Error {}
  *   providers.<id>: { name?, baseUrl?, api?, models: [{id, name?, reasoning?, contextWindow?, maxTokens?, input?, cost?}] }
  */
 export function buildModelsJson(settings) {
-  const models = (settings.models || []).map((m) => ({
-    id: m.id,
-    name: m.name || m.id,
-    reasoning: m.reasoning !== false,
-    input: ["text"],
-    contextWindow: m.contextWindow || 128000,
-    ...(m.maxTokens ? { maxTokens: m.maxTokens } : {}),
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-  }));
+  const models = (settings.models || []).map((m, i) => {
+    const id = typeof m?.id === "string" ? m.id.trim() : "";
+    if (!id) throw new PiRunnerError(`models[${i}] 缺少合法 id`);
+    return {
+      id,
+      name: m.name || id,
+      reasoning: m.reasoning !== false,
+      input: ["text"],
+      contextWindow: m.contextWindow || 128000,
+      ...(m.maxTokens ? { maxTokens: m.maxTokens } : {}),
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+  });
   if (!models.length) throw new PiRunnerError("设置中没有可用模型，请先在设置页添加");
   const baseUrl = typeof settings.baseUrl === "string" ? settings.baseUrl.trim() : "";
   return {

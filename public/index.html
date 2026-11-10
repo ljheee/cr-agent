@@ -299,12 +299,12 @@ async function renderReports(){
 }
 window.viewReport=async id=>{
   try{
+    // replaceState 更新 hash，避免 hashchange→applyHash→viewReport 双重请求回环
+    if(location.hash!=='#report/'+id) history.replaceState(null,'','#report/'+id);
     const r=await api(`/api/reports/${id}`);
-    // 可分享直达链接：#report/<id>，他人打开自动定位到该报告
-    if(location.hash!=='#report/'+id) location.hash='#report/'+id;
     let rp=document.getElementById('rp');
     if(!rp){rp=document.createElement('div');rp.id='rp';app.appendChild(rp);}
-    rp.innerHTML=`${renderReport(r)}<button class="ghost" onclick="document.getElementById('rp').remove();location.hash=''">关闭</button>`;
+    rp.innerHTML=`${renderReport(r)}<button class="ghost" onclick="document.getElementById('rp').remove();history.replaceState(null,'',location.pathname+location.search)">关闭</button>`;
     window.scrollTo(0,document.body.scrollHeight);
   }catch(e){
     alert(`报告不存在或已过期（${e.message}）`);

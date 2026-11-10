@@ -14,7 +14,7 @@ import { mkdir, writeFile, rm, rename, readdir } from "node:fs/promises";
 import path from "node:path";
 import { resolvePr, parsePrUrl } from "../pr-resolver.js";
 import { runCrTurn, FORMAT_RETRY_NUDGE } from "./pi-runner.js";
-import { normalizeReport, applyProgrammaticDemotion, coerceStringifiedJsonFields, coerceFindingLine } from "./report-schema.js";
+import { normalizeReport, applyProgrammaticDemotion, coerceStringifiedJsonFields, coerceFindingLine, appendDegradedStep } from "./report-schema.js";
 import { buildSystemPrompt, buildFastSystemPrompt, buildFullReviewUserPrompt, buildIncrementalUserPrompt } from "./prompts.js";
 import { Ledger } from "./ledger.js";
 import { routeByFileTypes } from "./routing.js";
@@ -126,9 +126,8 @@ export class CrWorkflow {
     } catch { /* 目录不存在 */ }
     if (!repoUsable) {
       report._verifier = { enabled: true, count: high.length, skipped: true, reason: "repo 源码树不可用（checkout 降级），跳过复核防盲裁" };
-      report.verification = report.verification || {};
-      report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-        `P0/P1 独立验证跳过：workDir/repo 无源码（checkout 降级），保留锚点定级（${high.length} 条未复核）`];
+      appendDegradedStep(report,
+        `P0/P1 独立验证跳过：workDir/repo 无源码（checkout 降级），保留锚点定级（${high.length} 条未复核）`);
       this.emit({ stage: "verifier", status: "skip", reason: "repo-unavailable" });
       return report._verifier;
     }
@@ -142,21 +141,18 @@ export class CrWorkflow {
       recomputeReportAggregates(report, "复核");
       report._verifier = { enabled: true, count: high.length, model, ...res, usage };
       if (res.voided.length) {
-        report.verification = report.verification || {};
-        report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-          `verifier 证伪剔除 ${res.voided.length} 条：${res.voided.slice(0, 3).join("；")}${res.voided.length > 3 ? "…" : ""}`];
+        appendDegradedStep(report,
+          `verifier 证伪剔除 ${res.voided.length} 条：${res.voided.slice(0, 3).join("；")}${res.voided.length > 3 ? "…" : ""}`);
       }
       if (res.downgraded.length) {
-        report.verification = report.verification || {};
-        report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-          `verifier 降级 ${res.downgraded.length} 条：${res.downgraded.slice(0, 3).join("；")}${res.downgraded.length > 3 ? "…" : ""}`];
+        appendDegradedStep(report,
+          `verifier 降级 ${res.downgraded.length} 条：${res.downgraded.slice(0, 3).join("；")}${res.downgraded.length > 3 ? "…" : ""}`);
       }
       this.emit({ stage: "verifier", status: "done", confirmed: res.confirmed, downgraded: res.downgraded.length, voided: res.voided.length });
     } catch (e) {
       report._verifier = { enabled: true, count: high.length, failed: true, error: String(e.message || e).slice(0, 300) };
-      report.verification = report.verification || {};
-      report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-        `P0/P1 独立验证会话失败（fail-open，保留锚点定级）：${String(e.message || e).slice(0, 200)}`];
+      appendDegradedStep(report,
+        `P0/P1 独立验证会话失败（fail-open，保留锚点定级）：${String(e.message || e).slice(0, 200)}`);
       this.emit({ stage: "verifier", status: "fail", error: String(e.message || e).slice(0, 200) });
     }
     return report._verifier;
@@ -542,15 +538,14 @@ export class CrWorkflow {
       // 证据程序化核验（先于锚点：谎报 snippet 降 unverified → 规则表自动封顶 P2）
       report._snippet_check = await verifySnippets(report, path.join(workDir, "repo"));
       if (report._snippet_check.missed) {
-        report.verification = report.verification || {};
-        report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-          `snippet 回查未命中源码强制降 unverified ${report._snippet_check.missed} 条：${report._snippet_check.notes.slice(0, 3).join("；")}${report._snippet_check.notes.length > 3 ? "…" : ""}`];
+        appendDegradedStep(report,
+          `snippet 回查未命中源码强制降 unverified ${report._snippet_check.missed} 条：${report._snippet_check.notes.slice(0, 3).join("；")}${report._snippet_check.notes.length > 3 ? "…" : ""}`);
       }
       // 定级锚点重算（含 P0/P1 证据门：unverified 物理封顶 P2；test-falsified 作废；
       // blockers 随推导重算，杜绝悬挂）——同 head 两轮 P3↔P1 漂移的根治；规则表可配置
       const { rules: sevRules, note: sevNote } = await loadSeverityRules(this.dataDir);
       applyAnchorSeverity(report, sevRules);
-      if (sevNote) { report.verification = report.verification || {}; report.verification.degraded_steps = [...(report.verification.degraded_steps || []), sevNote]; }
+      if (sevNote) appendDegradedStep(report, sevNote);
       report._severity_rules = sevRules.map((r) => r.id).join(",");
       report._usage = { bundles: subReports.map((r) => r?._usage || null) };
       report._toolCalls = subReports.reduce((a, r) => a + (r?._toolCalls || 0), 0);
@@ -574,15 +569,16 @@ export class CrWorkflow {
       // 证据程序化核验（同分桶路径）
       report._snippet_check = await verifySnippets(report, path.join(workDir, "repo"));
       if (report._snippet_check.missed) {
-        report.verification = report.verification || {};
-        report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-          `snippet 回查未命中源码强制降 unverified ${report._snippet_check.missed} 条：${report._snippet_check.notes.slice(0, 3).join("；")}${report._snippet_check.notes.length > 3 ? "…" : ""}`];
+        appendDegradedStep(report,
+          `snippet 回查未命中源码强制降 unverified ${report._snippet_check.missed} 条：${report._snippet_check.notes.slice(0, 3).join("；")}${report._snippet_check.notes.length > 3 ? "…" : ""}`);
       }
       // 定级锚点重算（含 P0/P1 证据门：unverified 物理封顶 P2）；规则表可配置
       const { rules: sevRules, note: sevNote } = await loadSeverityRules(this.dataDir);
       applyAnchorSeverity(report, sevRules);
-      if (sevNote) { report.verification = report.verification || {}; report.verification.degraded_steps = [...(report.verification.degraded_steps || []), sevNote]; }
+      if (sevNote) appendDegradedStep(report, sevNote);
       report._severity_rules = sevRules.map((r) => r.id).join(",");
+      // 单轮 _usage 统一为 {bundles:[...]}，与分桶路径同形
+      report._usage = { bundles: [report._usage || null] };
       // P0/P1 verifier 回路：独立会话复核证据链（fail-open）
       await this._runVerifier(report, settings, workDir, modelId, { repo: pr.repo, pr: pr.pr, title: pr.meta?.title });
     }
@@ -608,12 +604,7 @@ export class CrWorkflow {
     };
 
     // ── 截断/降级声明：diff 截断与拉取降级如实声明（防静默漏审） ──
-    const pushDegraded = (note) => {
-      report.verification = report.verification && typeof report.verification === "object" && !Array.isArray(report.verification)
-        ? report.verification : {};
-      const prev = Array.isArray(report.verification.degraded_steps) ? report.verification.degraded_steps : [];
-      report.verification.degraded_steps = [...prev, note];
-    };
+    const pushDegraded = (note) => { appendDegradedStep(report, note); };
     if (diffEmpty) {
       pushDegraded(`diff 无内容行（拉取退化或 PR 无变更）：本报告基于无 diff 的全仓检查，未做变更行级审查，结论不可作为发布依据`);
     }

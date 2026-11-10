@@ -18,7 +18,7 @@
  */
 
 import { DEFAULT_SEVERITY_RULES, EVIDENCE_RANK, IMPACT_RADII, TRIGGERS } from "./severity-rules-default.js";
-import { buildAuthorSummary } from "./report-schema.js";
+import { buildAuthorSummary, appendDegradedStep } from "./report-schema.js";
 
 // severity 字典序排名（不依赖 "P0"<"P1"<"P2"<"P3"<"void" 的字典序巧合）
 const SEVERITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
@@ -76,7 +76,8 @@ function ruleMatches(rule, f, a, isThisPr, contract) {
  */
 export function deriveSeverity(f, report, rules = DEFAULT_SEVERITY_RULES) {
   const a = normalizeAnchors(f);
-  const isThisPr = f.introduced_by !== "pre-existing";
+  // 仅显式 this-pr 视为本次引入；非法/其它值在 normalize 已压成 pre-existing，此处再防漏网
+  const isThisPr = f.introduced_by === "this-pr";
   const contract = isContractBreak(f, report);
   for (const rule of rules) {
     if (ruleMatches(rule, f, a, isThisPr, contract)) {
@@ -138,14 +139,12 @@ export function applyAnchorSeverity(report, rules = DEFAULT_SEVERITY_RULES) {
   }
   report.findings = kept;
   if (voided.length) {
-    report.verification = report.verification || {};
-    report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-      `锚点规则作废 ${voided.length} 条（void 级，如 test-falsified 证伪）：${voided.slice(0, 3).join("；")}${voided.length > 3 ? "…" : ""}`];
+    appendDegradedStep(report,
+      `锚点规则作废 ${voided.length} 条（void 级，如 test-falsified 证伪）：${voided.slice(0, 3).join("；")}${voided.length > 3 ? "…" : ""}`);
   }
   if (demotedOverrides.length) {
-    report.verification = report.verification || {};
-    report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-      `锚点重算覆盖程序化降档 ${demotedOverrides.length} 条：${demotedOverrides.slice(0, 3).join("；")}${demotedOverrides.length > 3 ? "…" : ""}`];
+    appendDegradedStep(report,
+      `锚点重算覆盖程序化降档 ${demotedOverrides.length} 条：${demotedOverrides.slice(0, 3).join("；")}${demotedOverrides.length > 3 ? "…" : ""}`);
   }
   // 聚合重算（blockers/conclusion/author_summary）——与 verifier 裁决应用共用同一收敦函数
   recomputeReportAggregates(report, "锚点重算");

@@ -73,20 +73,28 @@ export function selfCheck() {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain) {
   const args = process.argv.slice(2);
+  const flagVal = (name) => {
+    const i = args.indexOf(name);
+    if (i < 0) return null;
+    const v = args[i + 1];
+    if (!v || v.startsWith("-")) throw new Error(`${name} 需要参数值`);
+    return v;
+  };
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log("用法: node eval/run-eval.js [--self-check] | --report <path> --fixture <name>");
+    process.exit(0);
+  }
   if (args.includes("--report")) {
-    const reportPath = args[args.indexOf("--report") + 1];
+    const reportPath = flagVal("--report");
+    const fixtureName = flagVal("--fixture");
+    if (!fixtureName) throw new Error("--report 必须同时指定 --fixture <name>");
     const report = normalizeReport(readFileSync(reportPath, "utf8"));
-    const fixtureName = args.includes("--fixture") ? args[args.indexOf("--fixture") + 1] : null;
     const all = loadFixtures();
-    let fx;
-    if (fixtureName) {
-      fx = all.find((f) => f.name === fixtureName);
-      if (!fx) throw new Error(`fixture 不存在: ${fixtureName}`);
-    } else {
-      fx = all[0];
-    }
+    const fx = all.find((f) => f.name === fixtureName);
+    if (!fx) throw new Error(`fixture 不存在: ${fixtureName}`);
     console.log(JSON.stringify(score(fx, report), null, 2));
   } else {
+    // 默认或显式 --self-check：跑 fixture 自检
     const checks = selfCheck();
     for (const c of checks) {
       console.log(`${c.ok ? "✓" : "✗"} ${c.name}  路由: ${c.routing.join(",") || "(无命中)"}`);

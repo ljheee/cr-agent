@@ -39,8 +39,17 @@ export class Settings {
   static async load(dataDir) {
     await mkdir(dataDir, { recursive: true });
     const s = new Settings(path.join(dataDir, "settings.json"));
-    try { s.data = { ...DEFAULTS, ...JSON.parse(await readFile(s.file, "utf8")) }; }
-    catch { /* 首次 */ }
+    try {
+      const text = await readFile(s.file, "utf8");
+      try { s.data = { ...DEFAULTS, ...JSON.parse(text) }; }
+      catch (e) {
+        // 文件存在但损坏：不写回磁盘，仅内存回退默认并留痕（避免静默当「首次运行」丢凭证）
+        console.warn(`[settings] ${s.file} 解析失败，使用默认值（未覆盖磁盘）: ${e.message}`);
+        s._loadError = e.message;
+      }
+    } catch (e) {
+      if (e?.code !== "ENOENT") console.warn(`[settings] 读取失败: ${e.message}`);
+    }
     return s;
   }
 

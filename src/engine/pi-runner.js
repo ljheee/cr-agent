@@ -169,8 +169,14 @@ export async function runCrTurn(opts) {
   installMaxTokensHook();
 
   const agentDir = await preparePiDir(settings, dataDir, agentDirSub);
-  // 任务文件落盘（模型可用 read 工具查看）
-  await writeFile(path.join(workDir, "CR_TASK.md"), userPrompt);
+  // 任务文件落盘（模型可用 read 工具查看）。分桶时按桶分文件，避免并行桶互覆 CR_TASK.md
+  const bundleIdx = opts.bundleIdx;
+  const taskName = bundleIdx != null && bundleIdx !== "" ? `CR_TASK-bundle-${bundleIdx}.md` : "CR_TASK.md";
+  await writeFile(path.join(workDir, taskName), userPrompt);
+  // 单桶/兼容：同时维护 CR_TASK.md 指针（仅非分桶或串行可读；并行以 bundle 文件为准）
+  if (taskName !== "CR_TASK.md" && !(Number(settings?.bundleConcurrency) > 1)) {
+    try { await writeFile(path.join(workDir, "CR_TASK.md"), userPrompt); } catch { /* ignore */ }
+  }
 
   // 1) ModelRuntime：从隔离目录读 models.json / auth.json，解析自定义 provider 的 Model 对象
   const providerId = settings.providerId || "custom";

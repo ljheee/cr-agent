@@ -138,7 +138,8 @@ ${REPORT_JSON_INSTRUCTION}`;
  */
 export function buildFullReviewUserPrompt(ctx) {
   const { pr, diff, exempt, settings, otherFiles, routing, teamRules } = ctx;
-  const diffLimited = settings?.maxDiffChars ? diff.slice(0, settings.maxDiffChars) : diff.slice(0, 400000);
+  const maxDiff = Number.isInteger(settings?.maxDiffChars) && settings.maxDiffChars > 0 ? settings.maxDiffChars : 400000;
+  const diffLimited = diff.slice(0, maxDiff);
   const truncNote = diff.length > diffLimited.length ? `\n[diff 已截断至 ${diffLimited.length}/${diff.length} 字符，完整 diff 已落盘工作区 PR.diff，可用 read 工具查看]` : "";
   return `# 待审查 PR
 
@@ -169,7 +170,8 @@ ${exempt.map((e) => `- ${[e.file, e.title_keyword].filter(Boolean).join(" · ")}
  */
 export function buildIncrementalUserPrompt(ctx) {
   const { pr, diff, previousFindings, exempt, settings, routing, teamRules } = ctx;
-  const diffLimited = (settings?.maxDiffChars ? diff.slice(0, settings.maxDiffChars) : diff.slice(0, 400000));
+  const maxDiff = Number.isInteger(settings?.maxDiffChars) && settings.maxDiffChars > 0 ? settings.maxDiffChars : 400000;
+  const diffLimited = diff.slice(0, maxDiff);
   const truncNote2 = diff.length > diffLimited.length ? `\n[diff 已截断至 ${diffLimited.length}/${diff.length} 字符，完整 diff 已落盘工作区 PR.diff，可用 read 工具查看]` : "";
   const prev = previousFindings && previousFindings.length
     ? `## 历史问题清单（必须逐条复核状态）
@@ -200,7 +202,7 @@ ${exempt.map((e) => `- ${[e.file, e.title_keyword].filter(Boolean).join(" · ")}
 1. 审查本次新增改动（不重审未变化的文件，但其行为受影响时必须连带检查）。
 2. 逐条复核历史问题状态。
 3. 在 findings 中只报新问题 + 复核后确认仍存在的 P0/P1。
-4. 完成后调用 submit_review 工具一次性提交完整报告对象（唯一交付途径，不要在文本里输出报告），previous_findings 放在报告的 previous_findings 字段。`;
+4. 完成后调用 submit_review 工具一次性提交完整报告对象（唯一交付途径，不要在文本里输出报告），previous_findings 必须放在报告的 review.previous_findings 字段（不要放在顶层）。`;
 }
 
 /** JSON 结构中 review 字段的补充说明（增量轮） */

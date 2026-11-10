@@ -13,7 +13,7 @@ const FILETYPE_RULES = [
     note: "测试变更（delivery/test）：断言是否真的断言（非空跑）；边界与回归用例覆盖新逻辑。",
   },
   {
-    match: /(?:^|\/)dockerfile|docker-compose/i,
+    match: /(?:^|\/)(?:dockerfile|docker-compose)/i,
     focus: ["delivery", "security_fund"],
     note: "容器：基础镜像 tag 可变性、secrets 进镜像层、端口暴露面。",
   },

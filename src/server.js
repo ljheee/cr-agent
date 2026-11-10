@@ -35,6 +35,7 @@ const ongoing = new Map(); // reviewId -> {events:[], done, result}
 // 事件数上限：长会话/多桶时 agent-event 可达数万条，每次轮询全量返回会膨胀；超限后丢弃新 agent-event（仅计数）。
 // 2000 实测会在 1 分钟内打满，进度接口“装死”被误判为断流；放宽到 30000（约 6MB）
 const MAX_EVENTS = 30000;
+const MAX_EVENT_TEXT = 800; // 单事件 textHead/diagnostics 截断，防条数封顶前先撑爆内存
 // 并发审查闸改为 settings.maxConcurrentReviews（默认 3）；旧常量仅作 fallback
 const MAX_CONCURRENT_REVIEWS = () => settings.get().maxConcurrentReviews || 3;
 
@@ -64,7 +65,16 @@ app.post("/api/review", async (req, res) => {
         if (firstAgentIdx >= 0) events.splice(firstAgentIdx, 1);
         else return; // 全是关键事件也满了：丢弃新事件
       }
-      events.push({ at: new Date().toISOString(), ...e });
+      const ev = { at: new Date().toISOString(), ...e };
+      // 截断大字段，避免 textHead/diagnostics 在条数封顶前撑爆轮询响应
+      if (typeof ev.textHead === "string" && ev.textHead.length > MAX_EVENT_TEXT) ev.textHead = ev.textHead.slice(0, MAX_EVENT_TEXT);
+      if (ev.diagnostics && typeof ev.diagnostics === "object") {
+        try {
+          const s = JSON.stringify(ev.diagnostics);
+          if (s.length > MAX_EVENT_TEXT * 4) ev.diagnostics = { truncated: true, bytes: s.length };
+        } catch { ev.diagnostics = { truncated: true }; }
+      }
+      events.push(ev);
     },
   });
 
@@ -125,7 +135,12 @@ app.get("/api/tasks", (req, res) => {
 });
 
 // ── 设置 ──
-const maskKey = (k) => (k ? `••••${k.slice(-4)}（${k.length}字符）` : "");
+// 短钥（≤4）不回显任何原文，只报长度，避免整钥泄漏
+const maskKey = (k) => {
+  if (!k) return "";
+  if (k.length <= 4) return `••••（${k.length}字符）`;
+  return `••••${k.slice(-4)}（${k.length}字符）`;
+};
 const MASK = "****";
 const maskTokens = (t) => Object.fromEntries(Object.entries(t || {}).map(([h, v]) => [h, v ? MASK : ""]));
 
@@ -207,6 +222,13 @@ app.get("/api/reports/:id", async (req, res) => {
 });
 
 // ── 账本（问题闭环/豁免）──
+/** pr 必须为正整数，防 Number("1.5")/#NaN 影子账本 */
+function parsePositivePr(pr) {
+  const n = typeof pr === "number" ? pr : Number(String(pr ?? "").trim());
+  if (!Number.isInteger(n) || n <= 0) throw new Error("pr 须为正整数");
+  return n;
+}
+
 app.get("/api/ledger", async (req, res) => {
   try {
     const { repo, pr } = req.query;
@@ -226,7 +248,9 @@ app.get("/api/ledger", async (req, res) => {
       }
       return res.json(out);
     }
-    const l = await Ledger.load(DATA_DIR, repo, Number(pr));
+    let prNum;
+    try { prNum = parsePositivePr(pr); } catch (e) { return res.status(400).json({ error: e.message }); }
+    const l = await Ledger.load(DATA_DIR, repo, prNum);
     res.json({ ...l.data, stats: l.stats() });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -237,10 +261,12 @@ app.post("/api/ledger/exempt", async (req, res) => {
     if (!repo || !pr || !(file || titleKeyword)) return res.status(400).json({ error: "需要 repo/pr 和豁免条件" });
     // repo 白名单：账本内容会回流前端 innerHTML 渲染，任意字符串构成存储 XSS 面
     if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo))) return res.status(400).json({ error: "repo 需形如 owner/name" });
+    let prNum;
+    try { prNum = parsePositivePr(pr); } catch (e) { return res.status(400).json({ error: e.message }); }
     // 与审查同锁（repo#pr）：锁 key 用 parsePrUrl 同源规范化，防客户端传变体 repo（尾斜杠/大小写）绕过同一把锁
-    const lockKey = normalizeLockKey(repo, pr);
+    const lockKey = normalizeLockKey(repo, prNum);
     const result = await withPrLock(lockKey, async () => {
-      const l = await Ledger.load(DATA_DIR, repo, Number(pr));
+      const l = await Ledger.load(DATA_DIR, repo, prNum);
       l.addExempt({ file, title_keyword: titleKeyword, reason, exempted_by: exemptedBy });
       await l.save();
       return l.data.exempt;
@@ -254,10 +280,12 @@ app.delete("/api/ledger/exempt", async (req, res) => {
     const { repo, pr, index } = req.body || {};
     const idx = Number(index);
     if (!repo || !pr || !Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: "需要 repo/pr 和合法的 index" });
+    let prNum;
+    try { prNum = parsePositivePr(pr); } catch (e) { return res.status(400).json({ error: e.message }); }
     // 与审查同锁（repo#pr，规范化 key 同上）
-    const lockKey = normalizeLockKey(repo, pr);
+    const lockKey = normalizeLockKey(repo, prNum);
     const result = await withPrLock(lockKey, async () => {
-      const l = await Ledger.load(DATA_DIR, repo, Number(pr));
+      const l = await Ledger.load(DATA_DIR, repo, prNum);
       if (idx >= l.data.exempt.length) throw Object.assign(new Error("index 超出范围"), { status: 400 });
       l.removeExempt(idx);
       await l.save();

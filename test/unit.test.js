@@ -5,7 +5,7 @@ import { normalizeReport, buildAuthorSummary } from "../src/engine/report-schema
 import { PERSPECTIVES, DIMENSIONS, renderPerspectivesForPrompt, primaryPerspectiveId, listSecondaryPerspectives } from "../src/engine/perspectives.js";
 import { Ledger } from "../src/engine/ledger.js";
 import { buildModelsJson } from "../src/engine/pi-models.js"; // 纯函数模块：测试离线可跑，不拉 pi SDK 树
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -132,7 +132,8 @@ test("normalizeReport: markdown 包裹 + 规范化", () => {
   assert.equal(r.conclusion, "不通过");
   assert.equal(r.findings[0].severity, "P2");   // 非法 severity 降级 P2
   assert.ok(r.findings[0].confidence >= 0 && r.findings[0].confidence <= 1);
-  assert.ok(r.author_summary.must_fix.length + r.author_summary.should_fix.length >= 0);
+  assert.equal(r.author_summary.must_fix.length, 0);
+  assert.equal(r.author_summary.should_fix.length, 1);
   assert.equal(r.metrics.new_findings, 1);
 });
 
@@ -1665,13 +1666,69 @@ test("CR修复 F7: coerceFindingLine 跳过 null/空串，不把 null 变成 0",
   assert.equal(coerceFindingLine("x"), null);
 });
 
-test("CR修复 F10: normalizeReport 将字符串 degraded_steps 规范为空数组", async () => {
+test("CR修复 F10: normalizeReport 将字符串 degraded_steps 规范为单元素数组（不展开字符）", async () => {
   const { normalizeReport } = await import("../src/engine/report-schema.js");
   const r = normalizeReport({
     conclusion: "通过", one_line: "x", findings: [], checked_paths: ["a.js"],
     verification: { degraded_steps: "oops" },
   });
-  assert.ok(Array.isArray(r.verification.degraded_steps));
+  assert.deepEqual(r.verification.degraded_steps, ["oops"]);
+});
+
+test("CR r2 修复: review/release_plan 形状守卫 + introduced_by 非法值", async () => {
+  const { normalizeReport, buildAuthorSummary, coerceIntroducedBy } = await import("../src/engine/report-schema.js");
+  const r = normalizeReport({
+    conclusion: "通过", one_line: "x", findings: [], checked_paths: ["a.js"],
+    review: "none",
+    release_plan: { preconditions: "need db", rollback: "revert" },
+  });
+  assert.equal(typeof r.review, "object");
+  assert.ok(Array.isArray(r.review.previous_findings));
+  const sum = buildAuthorSummary(r);
+  assert.ok(typeof sum.release_note === "string");
+  assert.ok(!sum.release_note.includes("n") || sum.release_note.includes("need")); // 不拆字符
+  assert.equal(coerceIntroducedBy("maybe"), "pre-existing");
+  assert.equal(coerceIntroducedBy("this-pr"), "this-pr");
+});
+
+test("CR r2 修复: extractJson 优先 verdicts；buildModelsJson 缺 id；bitbucket gitUrl；locateFile 逃逸", async () => {
+  const { extractJson } = await import("../src/engine/verifier.js");
+  const got = extractJson('说明 {"x":1} 正文 {"verdicts":[{"id":"F1","verdict":"confirmed"}]}');
+  assert.ok(Array.isArray(got.verdicts));
+  assert.equal(got.verdicts[0].id, "F1");
+
+  const { buildModelsJson } = await import("../src/engine/pi-models.js");
+  assert.throws(() => buildModelsJson({ models: [{ name: "x" }] }), /id/);
+
+  const { gitUrlFor } = await import("../src/pr-resolver.js");
+  assert.ok(gitUrlFor({ host: "bb.corp", repo: "P/a", platform: "bitbucket" }, { gitScheme: "ssh" }).includes("/scm/P/a.git"));
+
+  const { verifySnippets } = await import("../src/engine/evidence-verify.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "cr-esc-"));
+  try {
+    await writeFile(path.join(dir, "ok.js"), "const alpha = 1;\nconst beta = 2;\n");
+    const rep = { findings: [{
+      id: "F1", file: "../etc/passwd", evidence_level: "code-confirmed",
+      code_snippet: "const alpha = 1;",
+    }] };
+    const st = await verifySnippets(rep, dir);
+    assert.equal(st.unlocatable, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CR r2 修复: docker-compose 边界；增量 previous_findings 路径；SSH accept-new", async () => {
+  const { routeByFileTypes } = await import("../src/engine/routing.js");
+  assert.ok(!routeByFileTypes(["mydocker-compose-helper.js"]).notes.some((n) => /容器/.test(n)), "子串不误命中");
+  assert.ok(routeByFileTypes(["docker-compose.yml"]).focusPerspectives.includes("delivery"));
+
+  const src = await (await import("node:fs/promises")).readFile(`${process.cwd()}/src/engine/prompts.js`, "utf8");
+  assert.ok(src.includes("review.previous_findings"), "增量提示词指向 review.previous_findings");
+
+  const prSrc = await (await import("node:fs/promises")).readFile(`${process.cwd()}/src/pr-resolver.js`, "utf8");
+  assert.ok(prSrc.includes("StrictHostKeyChecking=accept-new"));
+  assert.ok(!prSrc.includes("StrictHostKeyChecking=no"));
 });
 
 test("CR修复 F15: resolvePr 源码把 settings 传给 parsePrUrl", async () => {

@@ -69,24 +69,37 @@ export function buildVerifierUserPrompt(findings, prMeta = {}) {
   ].join("\n");
 }
 
-/** 从模型文本提取首个括号平衡 JSON 对象（字符串感知；无则 null） */
+/** 从模型文本提取括号平衡 JSON 对象（字符串感知）。
+ *  优先返回含 verdicts 数组的对象，避免前置散文里的花括号吞掉真正裁决 JSON。 */
 export function extractJson(text) {
-  const s = String(text || "").indexOf("{");
-  if (s < 0) return null;
-  let depth = 0, inStr = false, esc = false;
-  for (let i = s; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
+  const src = String(text || "");
+  let best = null;
+  for (let s = src.indexOf("{"); s >= 0; s = src.indexOf("{", s + 1)) {
+    let depth = 0, inStr = false, esc = false;
+    for (let i = s; i < src.length; i++) {
+      const ch = src[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const obj = JSON.parse(src.slice(s, i + 1));
+            if (obj && typeof obj === "object" && Array.isArray(obj.verdicts)) return obj;
+            if (!best) best = obj;
+          } catch { /* 继续找下一个 { */ }
+          break;
+        }
+      }
     }
-    if (ch === '"') inStr = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}") { depth--; if (depth === 0) { try { return JSON.parse(text.slice(s, i + 1)); } catch { return null; } } }
   }
-  return null;
+  return best;
 }
 
 /**

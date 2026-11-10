@@ -292,6 +292,60 @@ export function coerceStringifiedJsonFields(raw) {
   return out;
 }
 
+/** 字符串数组字段：拒绝字符串展开成字符；非数组标量包一层 */
+export function asStringArray(v) {
+  if (Array.isArray(v)) return v.map((x) => (x == null ? "" : String(x))).filter((s) => s.length > 0);
+  if (typeof v === "string" && v.trim()) return [v.trim()];
+  return [];
+}
+
+/** introduced_by 归一：仅认 this-pr / pre-existing；非法值按存量封顶（保守） */
+export function coerceIntroducedBy(v) {
+  if (v === "this-pr" || v === "pre-existing") return v;
+  if (v == null || v === "") return "this-pr";
+  return "pre-existing";
+}
+
+function coerceReviewObject(v) {
+  const base = reportTemplate().review;
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { ...base };
+  return {
+    ...base,
+    ...v,
+    previous_findings: Array.isArray(v.previous_findings) ? v.previous_findings : [],
+  };
+}
+
+function coerceReleasePlanObject(v) {
+  const base = reportTemplate().release_plan;
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { ...base };
+  return {
+    preconditions: asStringArray(v.preconditions),
+    monitoring: asStringArray(v.monitoring),
+    rollback: asStringArray(v.rollback),
+  };
+}
+
+function coerceVerificationObject(v) {
+  const base = reportTemplate().verification;
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { ...base };
+  return {
+    ...base,
+    ...v,
+    traces: Array.isArray(v.traces) ? v.traces : [],
+    unverified_upgrades: asStringArray(v.unverified_upgrades),
+    degraded_steps: asStringArray(v.degraded_steps),
+  };
+}
+
+/** 向 verification.degraded_steps 追加说明（保证数组形状，防字符串展开） */
+export function appendDegradedStep(report, msg) {
+  if (!report || !msg) return report;
+  report.verification = coerceVerificationObject(report.verification);
+  report.verification.degraded_steps = [...report.verification.degraded_steps, String(msg)];
+  return report;
+}
+
 /** 校验 + 规范化模型返回的 JSON（宽容解析） */
 export function normalizeReport(raw) {
   if (typeof raw === "string") {
@@ -345,6 +399,10 @@ export function normalizeReport(raw) {
   raw = coerceStringifiedJsonFields(raw);
   const report = { ...reportTemplate(), ...raw };
   report.schema_version = REPORT_SCHEMA_VERSION;
+  // 形状兜底必须在任何 [...x]/join 之前：模型常把 review/release_plan/verification 吐成字符串
+  report.review = coerceReviewObject(report.review);
+  report.release_plan = coerceReleasePlanObject(report.release_plan);
+  report.verification = coerceVerificationObject(report.verification);
   // 先规范化 findings（结论兜底依赖它；模型返回非数组时不能先 .some）
   const findings = Array.isArray(report.findings) ? report.findings : [];
   if (!REVIEW_CONCLUSIONS.includes(report.conclusion)) {
@@ -367,6 +425,7 @@ export function normalizeReport(raw) {
       dimension: dim,
       confidence: typeof f.confidence === "number" ? Math.max(0, Math.min(1, f.confidence)) : 0.7,
       evidence_level: EVIDENCE_LEVELS.includes(f.evidence_level) ? f.evidence_level : "unverified",
+      introduced_by: coerceIntroducedBy(f.introduced_by),
     };
   });
   // 修复档防线：repairJson 救活的截断报告可能带残缺 finding（缺 title——
@@ -375,9 +434,7 @@ export function normalizeReport(raw) {
   const dropped = report.findings.filter((f) => !String(f.title || "").trim());
   if (dropped.length) {
     report.findings = report.findings.filter((f) => String(f.title || "").trim());
-    if (!Array.isArray(report.verification?.degraded_steps)) report.verification = { ...(report.verification || {}) };
-    report.verification.degraded_steps = [...(report.verification.degraded_steps || []),
-      `丢弃 ${dropped.length} 条残缺 finding（截断修复产物，缺 title/evidence）`];
+    appendDegradedStep(report, `丢弃 ${dropped.length} 条残缺 finding（截断修复产物，缺 title/evidence）`);
     // 同步 blockers（被丢的 id 不应残留）
     const kept = new Set(report.findings.map((f) => f.id));
     report.blockers = (Array.isArray(report.blockers) ? report.blockers : []).filter((b) => kept.has(b));
@@ -402,8 +459,7 @@ export function normalizeReport(raw) {
   }
   // 规则 10 程序化兑底：结论为通过且无发现但 checked_paths 为空 → 视为未检查，降级声明
   if (report.conclusion === "通过" && report.findings.length === 0 && !(Array.isArray(report.checked_paths) && report.checked_paths.length)) {
-    if (!Array.isArray(report.verification?.degraded_steps)) report.verification = { ...(report.verification || {}) };
-    report.verification.degraded_steps = [...(report.verification.degraded_steps || []), "结论为通过且无发现，但未提供 checked_paths（规则 10：空清单视为未检查，建议人工确认覆盖范围）"];
+    appendDegradedStep(report, "结论为通过且无发现，但未提供 checked_paths（规则 10：空清单视为未检查，建议人工确认覆盖范围）");
   }
   // blockers 校验：模型提供的非空清单必须是合法 finding id 子集，否则重建（防垃圾 id / 漏 P0）
   const validIds = new Set(report.findings.map((f) => f.id));
@@ -411,15 +467,8 @@ export function normalizeReport(raw) {
   if (report.blockers.length === 0) {
     report.blockers = report.findings.filter((f) => f.severity === "P0" || f.severity === "P1").map((f) => f.id);
   }
-  // verification.* 数组字段兜底：模型若把 degraded_steps 吐成字符串，后续 [...str] 会展开成字符
-  if (!report.verification || typeof report.verification !== "object" || Array.isArray(report.verification)) {
-    report.verification = { ...reportTemplate().verification };
-  } else {
-    report.verification = { ...reportTemplate().verification, ...report.verification };
-  }
-  if (!Array.isArray(report.verification.degraded_steps)) report.verification.degraded_steps = [];
-  if (!Array.isArray(report.verification.traces)) report.verification.traces = [];
-  if (!Array.isArray(report.verification.unverified_upgrades)) report.verification.unverified_upgrades = [];
+  // 再归一一次 verification（上面 append 已保证；此处兜底 traces 等）
+  report.verification = coerceVerificationObject(report.verification);
 
   // author_summary 兜底生成
   if (!raw.author_summary) {
@@ -444,8 +493,8 @@ export function normalizeReport(raw) {
     : null;
   // 防护：模型返回非数组真值（如 "none"）不 crash（findings/checked_paths 同款兜底）；
   // applyRound/mergeReports 都依赖它可 filter
-  const prevFindingsArr = Array.isArray(report.review?.previous_findings) ? report.review.previous_findings : [];
-  if (report.review) report.review.previous_findings = prevFindingsArr;
+  const prevFindingsArr = Array.isArray(report.review.previous_findings) ? report.review.previous_findings : [];
+  report.review.previous_findings = prevFindingsArr;
   report.metrics = {
     perspectives_covered: (declaredCovered ?? [...new Set(report.findings.map((f) => f.category).filter(Boolean))])
       .map((id) => primaryPerspectiveId(id) || id)
@@ -473,7 +522,10 @@ export function buildAuthorSummary(report) {
     must_fix: must.map(fmt),
     should_fix: should.map(fmt),
     nice_to_have: nice.map(fmt),
-    release_note: report.release_plan ? [report.release_plan.preconditions?.join("；"), report.release_plan.rollback?.join("；")].filter(Boolean).join(" | ") : "",
+    release_note: (() => {
+      const rp = coerceReleasePlanObject(report.release_plan);
+      return [rp.preconditions.join("；"), rp.rollback.join("；")].filter(Boolean).join(" | ");
+    })(),
   };
 }
 
@@ -525,23 +577,23 @@ export function mergeReports(subReports, meta = {}, dedupeFn = null) {
     risks: present.flatMap((r) => r.risks || []),
     tests: present.flatMap((r) => r.tests || []),
     release_plan: {
-      preconditions: [...new Set(present.flatMap((r) => r.release_plan?.preconditions || []))],
-      monitoring: [...new Set(present.flatMap((r) => r.release_plan?.monitoring || []))],
-      rollback: [...new Set(present.flatMap((r) => r.release_plan?.rollback || []))],
+      preconditions: [...new Set(present.flatMap((r) => asStringArray(r.release_plan?.preconditions)))],
+      monitoring: [...new Set(present.flatMap((r) => asStringArray(r.release_plan?.monitoring)))],
+      rollback: [...new Set(present.flatMap((r) => asStringArray(r.release_plan?.rollback)))],
     },
     verification: {
       traces: subReports.flatMap((r, i) =>
-        (!r ? [] : (r.verification?.traces || [])).map((t) => ({ ...t, id: t.id ? `B${i + 1}-${t.id}` : t.id }))),
-      unverified_upgrades: present.flatMap((r) => r.verification?.unverified_upgrades || []),
+        (!r ? [] : (Array.isArray(r.verification?.traces) ? r.verification.traces : [])).map((t) => ({ ...t, id: t.id ? `B${i + 1}-${t.id}` : t.id }))),
+      unverified_upgrades: present.flatMap((r) => asStringArray(r.verification?.unverified_upgrades)),
       degraded_steps: [
-        ...present.flatMap((r) => r.verification?.degraded_steps || []),
+        ...present.flatMap((r) => asStringArray(r.verification?.degraded_steps)),
         ...failedNotes,
       ],
     },
-    checked_paths: [...new Set(present.flatMap((r) => r.checked_paths || []))],
+    checked_paths: [...new Set(present.flatMap((r) => asStringArray(r.checked_paths)))],
     metrics: {
-      perspectives_covered: [...new Set(present.flatMap((r) => r.metrics?.perspectives_covered || []))],
-      perspectives_skipped: [...new Set(present.flatMap((r) => r.metrics?.perspectives_skipped || []))],
+      perspectives_covered: [...new Set(present.flatMap((r) => asStringArray(r.metrics?.perspectives_covered)))],
+      perspectives_skipped: [...new Set(present.flatMap((r) => asStringArray(r.metrics?.perspectives_skipped)))],
       new_findings: deduped.length,
       prev_fixed: present.reduce((s, r) => s + (r.metrics?.prev_fixed || 0), 0),
       prev_still: present.reduce((s, r) => s + (r.metrics?.prev_still || 0), 0),

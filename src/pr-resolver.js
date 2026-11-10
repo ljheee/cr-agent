@@ -28,13 +28,24 @@ function hasContentLines(diff) {
   return /^\+(?!\+\+)./m.test(diff || "") || /^-(?!--)./m.test(diff || "");
 }
 
+/** Bitbucket path 字段可能是字符串，或带 string 型 toString 属性的对象（勿取 Function#toString） */
+function bitbucketPath(p) {
+  if (!p) return null;
+  if (typeof p === "string") return p;
+  if (typeof p === "object") {
+    if (typeof p.toString === "string") return p.toString;
+    if (p.name) return [p.parent, p.name].filter(Boolean).join("/").replace(/\/+/g, "/") || null;
+  }
+  return null;
+}
+
 /** Bitbucket Server JSON diff 渲染为 unified diff（降级路径：无 @@ 行号头，行号校验自动跳过） */
 function renderBitbucketJsonDiff(j) {
   return (j.diffs || []).map((d) => {
     // 删除文件 destination 为空/新增文件 source 为空：对称兑底到另一侧路径（与 git 同路径惯例一致），
     // 否则产出 b/ 空→ parseFiles 正则不认 → 文件丢失且内容行泄漏进上一桶
-    const src = d.source?.toString || d.destination?.toString || "dev/null";
-    const dest = d.destination?.toString || d.source?.toString || "dev/null";
+    const src = bitbucketPath(d.source) || bitbucketPath(d.destination) || "dev/null";
+    const dest = bitbucketPath(d.destination) || bitbucketPath(d.source) || "dev/null";
     const body = (d.hunks || []).map((h) =>
       (h.segments || []).map((seg) =>
         (seg.lines || []).map((l) => `${seg.type === "ADDED" ? "+" : seg.type === "REMOVED" ? "-" : " "}${l.text ?? l.line ?? ""}`).join("\n")
@@ -293,13 +304,15 @@ export function sshHostFor(host, settings) {
  * 2. settings.platformTokens[host] → https://<token>@host/repo.git（Bitbucket Server HTTP PAT）
  */
 export function gitUrlFor(parsed, settings) {
-  const { host, repo } = parsed;
+  const { host, repo, platform } = parsed;
   const scheme = settings?.gitScheme || "https";
-  if (scheme === "ssh") return `ssh://git@${sshHostFor(host, settings)}/${repo}.git`;
+  // Bitbucket Server/DC 仓库路径通常带 /scm/ 前缀，缺了会 404
+  const repoPath = platform === "bitbucket" ? `scm/${repo}` : repo;
+  if (scheme === "ssh") return `ssh://git@${sshHostFor(host, settings)}/${repoPath}.git`;
   const cred = settings?.platformTokens?.[host];
   // token 需 URL 编码：含 / @ : 等字符的 token 直接拼会坏 URL
   const authPrefix = cred ? `${encodeURIComponent(cred)}@` : "";
-  return `${scheme}://${authPrefix}${host}/${repo}.git`;
+  return `${scheme}://${authPrefix}${host}/${repoPath}.git`;
 }
 
 /** 检测环境是否有可用 ssh key（存在即认为可用；BatchMode 下失败会快速报错，不影响降级链） */
@@ -333,9 +346,11 @@ export async function fetchPrViaGit(parsed, settings, opts = {}) {
   remoteCandidates.push(originUrl);
   // 显式指定 ssh 时不重复；host 存在且环境有 key 时追加 ssh 兑底
   if (settings?.gitScheme !== "ssh" && host && hasSshKey()) {
-    remoteCandidates.push(`ssh://git@${sshHostFor(host, settings)}/${repo}.git`);
+    const repoPath = platform === "bitbucket" ? `scm/${repo}` : repo;
+    remoteCandidates.push(`ssh://git@${sshHostFor(host, settings)}/${repoPath}.git`);
   }
-  const sshEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no -o BatchMode=yes" };
+  // accept-new：首次入库主机密钥，拒绝密钥变更（不再禁用主机密钥校验）
+  const sshEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes" };
   const env = sshEnv;
   const dir = keepRepo || await mkdtemp(path.join(tmpdir(), `cr-pr-${pr}-`));
   if (keepRepo) await mkdir(keepRepo, { recursive: true }); // cwd 不存在时 spawn 直接 ENOENT

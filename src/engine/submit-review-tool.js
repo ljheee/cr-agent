@@ -29,7 +29,8 @@ export function buildSubmitReviewSchema() {
     category: Type.Optional(Type.String()),
     dimension: Type.Optional(Type.String()),
     file: Type.String(),
-    line: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+    // 与 normalizeReport/coerceFindingLine 对齐：允许字符串数字
+    line: Type.Optional(Type.Union([Type.Number(), Type.String(), Type.Null()])),
     code_snippet: Type.Optional(Type.String()),
     evidence: Type.String(),
     impact: Type.Optional(Type.String()),
@@ -47,6 +48,15 @@ export function buildSubmitReviewSchema() {
     one_line: Type.String(),
     impact_summary: Type.Optional(Type.String()),
     blockers: Type.Optional(Type.Array(Type.String())),
+    // 增量闭环：previous_findings 必须在 review 下（与 REPORT_JSON_INSTRUCTION / prompts 一致）
+    review: Type.Optional(Type.Object({
+      mode: Type.Optional(Type.String()),
+      previous_findings: Type.Optional(Type.Array(Type.Object({
+        id: Type.String(),
+        status: Type.String(),
+        note: Type.Optional(Type.String()),
+      }))),
+    })),
     findings: Type.Array(Finding),
     changes: Type.Optional(Type.Array(Type.Object({
       file: Type.String(),
@@ -62,7 +72,8 @@ export function buildSubmitReviewSchema() {
     decision_changes: Type.Optional(Type.Array(Type.Object({
       trace_id: Type.String(),
       file: Type.String(),
-      line: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+      // 与 normalizeReport/coerceFindingLine 对齐：允许字符串数字
+    line: Type.Optional(Type.Union([Type.Number(), Type.String(), Type.Null()])),
       check_kind: Type.Optional(Type.String()),
       decision: Type.Optional(Type.String()),
       boundary_input: Type.Optional(Type.String()),
