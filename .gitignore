@@ -3,6 +3,9 @@
 # dependencies
 /node_modules
 
+# 本地 MCP 配置可能含命令行密钥；示例文件保留提交
+.pi/mcp.json
+
 data
 .idea
 .DS_Store

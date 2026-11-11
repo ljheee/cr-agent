@@ -23,6 +23,11 @@ import { ModelRuntime, DefaultResourceLoader, SessionManager, SettingsManager } 
 import { PiRunnerError, buildModelsJson } from "./pi-models.js";
 import { createSubmitReviewTool } from "./submit-review-tool.js";
 import { normalizeReport } from "./report-schema.js";
+import {
+  discoverAgentExtras,
+  buildResourceLoaderExtras,
+  installMcpConfigToAgentDir,
+} from "./agent-extras.js";
 
 export { PiRunnerError, buildModelsJson };
 
@@ -178,6 +183,22 @@ export async function runCrTurn(opts) {
     try { await writeFile(path.join(workDir, "CR_TASK.md"), userPrompt); } catch { /* ignore */ }
   }
 
+  // 可选 Skills / MCP：读 cr-agent 根目录 skills/ 与 .pi/mcp.json（空=与历史一致不启用）
+  const extras = await discoverAgentExtras({
+    packageRoot: opts.packageRoot,
+    skillDir: settings?.skillDir || opts.skillDir,
+  });
+  const loaderExtras = buildResourceLoaderExtras(extras);
+  if (extras.hasMcp) {
+    await installMcpConfigToAgentDir(agentDir, extras.mcpRaw);
+    try {
+      const { createMcpExtension } = await import("@earendil-works/pi-coding-agent");
+      loaderExtras.extensionFactories = [createMcpExtension()];
+    } catch (e) {
+      throw new PiRunnerError(`启用 MCP 失败（createMcpExtension）：${e?.message || e}`);
+    }
+  }
+
   // 1) ModelRuntime：从隔离目录读 models.json / auth.json，解析自定义 provider 的 Model 对象
   const providerId = settings.providerId || "custom";
   const modelRuntime = await ModelRuntime.create({
@@ -190,21 +211,23 @@ export async function runCrTurn(opts) {
   }
 
   // 2) ResourceLoader：appendSystemPrompt 注入 CR 系统提示词（SDK 唯一官方途径）
+  //    noSkills/noExtensions 仍默认 true，避免扫描被审 workDir；skills 只走 additionalSkillPaths
   const settingsManager = SettingsManager.create(workDir, agentDir);
   const resourceLoader = new DefaultResourceLoader({
     cwd: workDir,
     agentDir,
     settingsManager,
     appendSystemPrompt: [systemPrompt],
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
+    ...loaderExtras,
   });
   await resourceLoader.reload();
 
   // 3) 创建会话：工具白名单可配（verifier 复核会话不装 submit_review，文本 JSON 交付）
   //    submit_review（constrainedSampling strict:prefer + terminate）仅 CR 交付会话创建
+  //    MCP 启用时追加 mcp__*：SDK 对 direct 暴露的 MCP 工具要求白名单匹配才能声明给模型
+  const toolsForSession = loaderExtras.extraToolAllowlist?.length
+    ? [...new Set([...allowedTools, ...loaderExtras.extraToolAllowlist])]
+    : allowedTools;
   const wantSubmitTool = allowedTools.includes("submit_review");
   let submittedReport = null;
   const submitReviewTool = wantSubmitTool ? createSubmitReviewTool({
@@ -219,7 +242,7 @@ export async function runCrTurn(opts) {
     modelRuntime,
     model,
     thinkingLevel,
-    tools: allowedTools,
+    tools: toolsForSession,
     customTools: submitReviewTool ? [submitReviewTool] : [],
     resourceLoader,
     sessionManager: SessionManager.inMemory(workDir),

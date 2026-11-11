@@ -68,6 +68,8 @@ npm start            # http://localhost:3777
 
 设置项（设置页 / `data/settings.json`）：`baseUrl`、`apiKey`、`models[]`、`defaultModel`、`defaultThinking`、`maxDiffChars`、`platformTokens`（各 git host 的 token）、`usePlatformApi`、`gitScheme`。
 
+可选扩展（维护者配置，空则与默认一致不启用）：根目录 `skills/`（Agent Skills）、`.pi/mcp.json`（MCP，见 `.pi/mcp.json.example`）。只从 cr-agent 安装根加载，不扫描被审 PR 工作区。
+
 ## PR 链接支持
 
 - GitHub：`https://github.com/{owner}/{repo}/pull/{n}`

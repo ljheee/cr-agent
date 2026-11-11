@@ -5,7 +5,7 @@ import { normalizeReport, buildAuthorSummary } from "../src/engine/report-schema
 import { PERSPECTIVES, DIMENSIONS, renderPerspectivesForPrompt, primaryPerspectiveId, listSecondaryPerspectives } from "../src/engine/perspectives.js";
 import { Ledger } from "../src/engine/ledger.js";
 import { buildModelsJson } from "../src/engine/pi-models.js"; // 纯函数模块：测试离线可跑，不拉 pi SDK 树
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -1755,4 +1755,146 @@ test("CR修复 F13: downgrade 已低于 P1 时 verdict 保留 downgrade", async 
   applyVerifierVerdicts(report, [{ id: "F1", verdict: "downgrade", reason: "x" }]);
   assert.equal(report.findings[0]._verifier.verdict, "downgrade");
   assert.equal(report.findings[0]._verifier.applied, false);
+});
+
+/* ───────── 反夸大：窄域程序化钳制（核实结论）───────── */
+test("anti-exaggeration: 无可用 snippet 的 code-confirmed/certain 被钳制", async () => {
+  const { clampExaggerationAnchors } = await import("../src/engine/anti-exaggeration.js");
+  const { deriveSeverity } = await import("../src/engine/severity-anchors.js");
+  const f = {
+    id: "F1", title: "假确认", file: "src/a.js",
+    evidence_level: "code-confirmed", trigger: "certain",
+    impact_radius: "all-traffic", introduced_by: "this-pr",
+    code_snippet: "", category: "correctness",
+  };
+  clampExaggerationAnchors({ findings: [f] });
+  assert.equal(f.evidence_level, "unverified");
+  assert.equal(f.trigger, "data-dependent");
+  assert.ok(String(f._anchor_clamp || "").includes("no-snippet"));
+  // 钳制后不得走 P0
+  assert.equal(deriveSeverity(f, {}).severity, "P2");
+});
+
+test("anti-exaggeration: 有实质 snippet 的 code-confirmed+certain 不被误伤", async () => {
+  const { clampExaggerationAnchors } = await import("../src/engine/anti-exaggeration.js");
+  const { deriveSeverity } = await import("../src/engine/severity-anchors.js");
+  const f = {
+    id: "F1", title: "真确认", file: "src/a.js",
+    evidence_level: "code-confirmed", trigger: "certain",
+    impact_radius: "all-traffic", introduced_by: "this-pr",
+    code_snippet: "export function runCrTurn(opts) {\n  await session.prompt(userPrompt);\n}",
+    category: "correctness",
+  };
+  clampExaggerationAnchors({ findings: [f] });
+  assert.equal(f.evidence_level, "code-confirmed");
+  assert.equal(f.trigger, "certain");
+  assert.equal(deriveSeverity(f, {}).severity, "P0");
+});
+
+test("anti-exaggeration: 文档/锁文件强制 delivery + impact none → P3", async () => {
+  const { clampExaggerationAnchors, forceCategoryByPath } = await import("../src/engine/anti-exaggeration.js");
+  const { deriveSeverity, applyAnchorSeverity } = await import("../src/engine/severity-anchors.js");
+  assert.equal(forceCategoryByPath("README.md"), "delivery");
+  assert.equal(forceCategoryByPath(".gitignore"), "delivery");
+  assert.equal(forceCategoryByPath("src/server.js"), null);
+  const f = {
+    id: "F1", title: "README 过时", file: "README.md",
+    evidence_level: "code-confirmed", trigger: "certain",
+    impact_radius: "single", introduced_by: "this-pr",
+    code_snippet: "npm test    # node --test：…… 53 项",
+    category: "correctness", // 企图逃逸 delivery 封顶
+  };
+  clampExaggerationAnchors({ findings: [f] });
+  assert.equal(f.category, "delivery");
+  assert.equal(f.impact_radius, "none");
+  const rep = applyAnchorSeverity({ findings: [f], conclusion: "不通过", blockers: ["F1"] });
+  assert.equal(rep.findings[0].severity, "P3");
+});
+
+test("anti-exaggeration: test 路径强制 delivery（保留 single 走 P3-C3）", async () => {
+  const { clampExaggerationAnchors } = await import("../src/engine/anti-exaggeration.js");
+  const { deriveSeverity } = await import("../src/engine/severity-anchors.js");
+  const f = {
+    id: "F1", title: "缺断言", file: "test/unit.test.js",
+    evidence_level: "code-confirmed", trigger: "certain",
+    impact_radius: "single", introduced_by: "this-pr",
+    code_snippet: "assert.ok(r.author_summary.must_fix.length + r.author_summary.should_fix.length >= 0);",
+    category: "correctness",
+  };
+  clampExaggerationAnchors({ findings: [f] });
+  assert.equal(f.category, "delivery");
+  assert.equal(f.impact_radius, "single"); // 不强制 none
+  assert.equal(deriveSeverity(f, {}).rule, "P3-C3-delivery-cap");
+});
+
+test("agent-extras: 空 skills / 空 mcp → 与历史一致不启用", async () => {
+  const { discoverAgentExtras, buildResourceLoaderExtras, parseMcpServers, skillDirHasContent } =
+    await import("../src/engine/agent-extras.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "cr-extras-"));
+  try {
+    await mkdir(path.join(dir, "skills"), { recursive: true });
+    await mkdir(path.join(dir, ".pi"), { recursive: true });
+    await writeFile(path.join(dir, "skills", "README.md"), "# docs only\n");
+    assert.equal(await skillDirHasContent(path.join(dir, "skills")), false);
+    assert.deepEqual(parseMcpServers({}), []);
+    assert.deepEqual(parseMcpServers({ mcpServers: {} }), []);
+    const d = await discoverAgentExtras({ packageRoot: dir });
+    assert.equal(d.hasSkills, false);
+    assert.equal(d.hasMcp, false);
+    const loader = buildResourceLoaderExtras(d);
+    assert.equal(loader.noSkills, true);
+    assert.equal(loader.noExtensions, true);
+    assert.deepEqual(loader.additionalSkillPaths, []);
+    assert.deepEqual(loader.extraToolAllowlist, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("agent-extras: 有 SKILL.md 与 mcpServers → 打开 paths / mcp__*", async () => {
+  const { discoverAgentExtras, buildResourceLoaderExtras, installMcpConfigToAgentDir } =
+    await import("../src/engine/agent-extras.js");
+  const dir = await mkdtemp(path.join(tmpdir(), "cr-extras2-"));
+  try {
+    await mkdir(path.join(dir, "skills", "demo"), { recursive: true });
+    await writeFile(path.join(dir, "skills", "demo", "SKILL.md"), "---\nname: demo\ndescription: d\n---\n# Demo\n");
+    await mkdir(path.join(dir, ".pi"), { recursive: true });
+    const mcp = { mcpServers: { demo: { command: "echo", args: ["1"], enabled: true, exposure: "direct" } } };
+    await writeFile(path.join(dir, ".pi", "mcp.json"), JSON.stringify(mcp));
+    const d = await discoverAgentExtras({ packageRoot: dir });
+    assert.equal(d.hasSkills, true);
+    assert.equal(d.hasMcp, true);
+    assert.deepEqual(d.mcpServers, ["demo"]);
+    const loader = buildResourceLoaderExtras(d);
+    assert.deepEqual(loader.additionalSkillPaths, [path.join(dir, "skills")]);
+    assert.deepEqual(loader.extraToolAllowlist, ["mcp__*"]);
+    const agentDir = path.join(dir, "pi-home");
+    await mkdir(agentDir, { recursive: true });
+    const installed = await installMcpConfigToAgentDir(agentDir, d.mcpRaw);
+    assert.ok(installed.endsWith("mcp.json"));
+    const raw = JSON.parse(await (await import("node:fs/promises")).readFile(installed, "utf8"));
+    assert.ok(raw.mcpServers.demo);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("anti-exaggeration: Settings.update 已校验字段 → 已知守卫降档 P3", async () => {
+  const { clampExaggerationAnchors } = await import("../src/engine/anti-exaggeration.js");
+  const { applyAnchorSeverity } = await import("../src/engine/severity-anchors.js");
+  const f = {
+    id: "F21", title: "prompts.js 两处 maxDiffChars 切片无类型/范围守卫",
+    file: "src/engine/prompts.js",
+    evidence_level: "code-confirmed", trigger: "certain",
+    impact_radius: "single", introduced_by: "this-pr",
+    code_snippet: "const diffLimited = settings?.maxDiffChars ? diff.slice(0, settings.maxDiffChars) : diff.slice(0, 400000);",
+    category: "correctness",
+    evidence: "Settings.update 已要求正整数，但 prompts 切片无守卫",
+  };
+  clampExaggerationAnchors({ findings: [f] });
+  assert.equal(f.impact_radius, "none");
+  assert.equal(f.category, "delivery");
+  assert.ok(String(f._anchor_clamp || "").includes("known-settings-guard"));
+  const rep = applyAnchorSeverity({ findings: [f], conclusion: "不通过", blockers: ["F21"] });
+  assert.equal(rep.findings[0].severity, "P3");
 });

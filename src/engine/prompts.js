@@ -87,6 +87,7 @@ const DISCIPLINE = `
 2. 不编造：无法核实的跨仓/运行时行为，在 decision_changes 中标 unverified 或 needs_human，严禁假装确定。
 3. 修复建议 100% 必填且可执行；能给出具体代码改法的给出改法。
 4. 定级锚点（需逐项勾选，系统按规则重算 severity）：P0=本次引入∧全部流量∧必然触发∧证据≥code-confirmed；P1=触发确定∧影响整批及以上∧证据≥code-confirmed，或契约破坏；P2=单请求级已确认缺陷、数据依赖触发、unverified 封顶、存量非契约封顶；P3=无行为影响（风格/卫生）或 delivery 轴卫生项。锚点字段（impact_radius/trigger）必须如实枚举，不要为了拔高/压低定级而虚构半径或触发确定性。
+4b. 反夸大：evidence 只写可核对的代码事实；impact 只写有触发路径的后果。无 code_snippet 不得标 code-confirmed；说不清触发条件不得标 trigger=certain。README/.gitignore/测试缺口属 delivery 卫生（P3），勿塞进 correctness/security 逃逸。Settings.update 已校验的配置项（如 maxDiffChars）缺本地切片守卫≠运行时必炸，最多报 P3。
 5. introduced_by 要区分本次引入 vs 存量问题（存量 P3 不报，存量 P1/P2 报但标注）。
 6. 不重复报已豁免的问题（豁免清单在上下文中给出时）。
 7. 大 PR 至少给出 1 条 tests 建议（针对最关键路径）；小 PR 可省略。

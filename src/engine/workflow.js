@@ -40,6 +40,7 @@ import { parseFiles, bundleFiles, sliceDiff, validateFindingLine, dedupeFindings
 import { mergeReports } from "./report-schema.js";
 import { applyAnchorSeverity, recomputeReportAggregates } from "./severity-anchors.js";
 import { verifySnippets } from "./evidence-verify.js";
+import { clampExaggerationAnchors } from "./anti-exaggeration.js";
 import { runVerifierSession, applyVerifierVerdicts } from "./verifier.js";
 import { persistBundleReport } from "./submit-review-tool.js";
 import { DEFAULT_SEVERITY_RULES, validateSeverityRules } from "./severity-rules-default.js";
@@ -541,6 +542,8 @@ export class CrWorkflow {
         appendDegradedStep(report,
           `snippet 回查未命中源码强制降 unverified ${report._snippet_check.missed} 条：${report._snippet_check.notes.slice(0, 3).join("；")}${report._snippet_check.notes.length > 3 ? "…" : ""}`);
       }
+      // 反夸大窄域钳制（无 snippet / 路径轴 / 已知 Settings 守卫）→ 再锚点定级
+      report._anchor_clamp = clampExaggerationAnchors(report);
       // 定级锚点重算（含 P0/P1 证据门：unverified 物理封顶 P2；test-falsified 作废；
       // blockers 随推导重算，杜绝悬挂）——同 head 两轮 P3↔P1 漂移的根治；规则表可配置
       const { rules: sevRules, note: sevNote } = await loadSeverityRules(this.dataDir);
@@ -572,6 +575,7 @@ export class CrWorkflow {
         appendDegradedStep(report,
           `snippet 回查未命中源码强制降 unverified ${report._snippet_check.missed} 条：${report._snippet_check.notes.slice(0, 3).join("；")}${report._snippet_check.notes.length > 3 ? "…" : ""}`);
       }
+      report._anchor_clamp = clampExaggerationAnchors(report);
       // 定级锚点重算（含 P0/P1 证据门：unverified 物理封顶 P2）；规则表可配置
       const { rules: sevRules, note: sevNote } = await loadSeverityRules(this.dataDir);
       applyAnchorSeverity(report, sevRules);

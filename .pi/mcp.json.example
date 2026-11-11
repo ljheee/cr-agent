@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "example": {
+      "command": "npx",
+      "args": ["-y", "some-mcp-server"],
+      "enabled": true,
+      "exposure": "direct"
+    }
+  }
+}
